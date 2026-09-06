@@ -1,0 +1,49 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "type": "shell",
+            "label": "C/C++: gcc.exe build active file",
+            "command": "C:\\msys64\\ucrt64\\bin\\gcc.exe",
+            "args": [
+                "-fdiagnostics-color=always",
+                "-g",
+                "${file}",
+                "-o",
+                "${fileDirname}\\${fileBasenameNoExtension}.exe",
+                "-lgdi32",
+                "-luser32",
+                "-lcomctl32",
+                "-lwinmm",
+                "-luxtheme",
+                "-lmsimg32"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "Build and Run AQI Monitor",
+            "type": "shell",
+            "command": "cmd",
+            "args": [
+                "/c",
+                "cd /d \"${workspaceFolder}\" && if not exist build mkdir build && C:\\msys64\\ucrt64\\bin\\gcc.exe -g src\\main.c -o build\\aqi_monitor.exe -lgdi32 -luser32 -lcomctl32 -lwinmm -luxtheme -lmsimg32 && start \"\" \"build\\aqi_monitor.exe\""
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [],
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            }
+        }
+    ]
+}
