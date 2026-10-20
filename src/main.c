@@ -1,42 +1,11 @@
 #include <windows.h>
 #include <commctrl.h>
-#include <mmsystem.h>
 #include <uxtheme.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
-
-#define INITIAL_HEAP_CAPACITY 64
-#define REGION_COUNT 30
-#define ALERT_THRESHOLD_AQI 300
-#define SPARKLINE_POINTS 90
-#define RECENT_ROWS_LIMIT 200
-#define MAX_TOASTS 5
-#define ID_TOAST_TIMER 1
-
-#define TIMER_STREAM_ID 1001
-#define TIMER_BST_SEARCH 1002
-
-#define ID_TAB_CONTROL         2001
-#define ID_BTN_START           2002
-#define ID_BTN_STOP            2003
-#define ID_BTN_EXTRACT         2004
-#define ID_BTN_SEARCH          2005
-#define ID_BTN_GEN_REPORT      2006
-#define ID_COMBO_SEARCH        2008
-
-
-#define COLOR_BG            RGB(248, 250, 252)
-#define COLOR_CARD_BG       RGB(255, 255, 255)
-#define COLOR_HEADER_BG     RGB(15, 23, 42)
-#define COLOR_BORDER        RGB(226, 232, 240)
-#define COLOR_TEXT_DARK     RGB(15, 23, 42)
-#define COLOR_TEXT_MUTED    RGB(100, 116, 139)
-#define COLOR_PRIMARY       RGB(37, 99, 235)
-#define COLOR_ACCENT_GREEN RGB(16, 185, 129)
-#define COLOR_ACCENT_RED   RGB(225, 29, 72)
 
 typedef struct {
     int region_id;
@@ -70,9 +39,7 @@ typedef struct BSTNode {
     struct BSTNode *right;
 } BSTNode;
 
-typedef void (*BSTVisitor)(const BSTNode *node, void *user_data);
-
-const char *REGION_NAMES[REGION_COUNT] = {
+const char *REGION_NAMES[30] = {
     "Colaba (South Mumbai)", "Marine Drive / Churchgate", "Fort / CST", "Malabar Hill",
     "Worli", "Lower Parel", "Dadar", "Prabhadevi", "Mahim", "Bandra West",
     "BKC (Bandra Kurla)", "Khar West", "Santacruz", "Vile Parle", "Andheri West",
@@ -89,10 +56,10 @@ typedef struct {
     long long sum_aqi_all;
     int peak_aqi_all;
 
-    double history[SPARKLINE_POINTS];
+    double history[90];
     int history_count;
 
-    BOOL region_active[REGION_COUNT];
+    BOOL region_active[30];
 
     BOOL running;
     UINT_PTR timer_id;
@@ -124,13 +91,14 @@ typedef struct {
     HWND hwnd_edit_search_info;
     HWND hwnd_bst_tree;
     HWND hwnd_lbl_bst_step;
-    const BSTNode *bst_search_path[REGION_COUNT];
+    const BSTNode *bst_search_path[30];
     int bst_search_path_count;
     int bst_search_step;
     int bst_search_target;
     const BSTNode *bst_search_result;
     int bst_tree_scroll_x;
     int bst_tree_scroll_y;
+    int bst_tree_zoom_percent;
 
     HWND hwnd_lv_report;
     HWND hwnd_lbl_report_stats;
@@ -138,7 +106,7 @@ typedef struct {
     HWND hwnd_btn_start;
     HWND hwnd_btn_stop;
 
-    HWND toast_hwnds[MAX_TOASTS];
+    HWND toast_hwnds[5];
     int toast_count;
 
     HFONT font_title;
@@ -154,6 +122,8 @@ typedef struct {
 
 static AppState g_app;
 
+/* dsa */
+
 static void swap_nodes(AlertNode *a, AlertNode *b) {
     AlertNode temp = *a;
     *a = *b;
@@ -161,7 +131,7 @@ static void swap_nodes(AlertNode *a, AlertNode *b) {
 }
 
 void heap_init(AlertHeap *heap) {
-    heap->capacity = INITIAL_HEAP_CAPACITY;
+    heap->capacity = 64;
     heap->tree = (AlertNode *)calloc((size_t)heap->capacity, sizeof(AlertNode));
     heap->size = 0;
 }
@@ -173,9 +143,9 @@ void heap_free(AlertHeap *heap) {
     heap->capacity = 0;
 }
 
-int heap_is_empty(const AlertHeap *heap) { return heap->size <= 0; }
-
-
+int heap_is_empty(const AlertHeap *heap) {
+    return heap->size <= 0;
+}
 
 static int heap_ensure_capacity(AlertHeap *heap) {
     if (heap->size < heap->capacity) return 1;
@@ -187,14 +157,12 @@ static int heap_ensure_capacity(AlertHeap *heap) {
     return 1;
 }
 
-
 static void sift_up(AlertHeap *heap, int i) {
     while (i != 0 && heap->tree[(i - 1) / 2].aqi < heap->tree[i].aqi) {
         swap_nodes(&heap->tree[i], &heap->tree[(i - 1) / 2]);
         i = (i - 1) / 2;
     }
 }
-
 
 static void max_heapify(AlertHeap *heap, int idx) {
     int largest = idx;
@@ -210,8 +178,6 @@ static void max_heapify(AlertHeap *heap, int idx) {
     }
 }
 
-
-
 void heap_insert(AlertHeap *heap, int region_id, int aqi, double pm25, long timestamp) {
     if (!heap_ensure_capacity(heap)) return;
 
@@ -225,7 +191,6 @@ void heap_insert(AlertHeap *heap, int region_id, int aqi, double pm25, long time
     sift_up(heap, i);
 }
 
-
 AlertNode heap_extract_max(AlertHeap *heap) {
     if (heap_is_empty(heap)) {
         AlertNode empty_node = { -1, -1, 0.0, 0 };
@@ -237,10 +202,6 @@ AlertNode heap_extract_max(AlertHeap *heap) {
     max_heapify(heap, 0);
     return max_alert;
 }
-
-
-
-
 
 static BSTNode *create_node(int region_id, int aqi_val, double pm25_val, long timestamp) {
     BSTNode *node = (BSTNode *)malloc(sizeof(BSTNode));
@@ -280,20 +241,29 @@ BSTNode *bst_insert_or_update(BSTNode *root, int region_id, int aqi_val, double 
 static BSTNode *bst_search_trace(BSTNode *root, int target_region_id,
                                  const BSTNode **path, int *path_count) {
     *path_count = 0;
-    while (root && *path_count < REGION_COUNT) {
+    while (root && *path_count < 30) {
         path[(*path_count)++] = root;
         if (root->region_id == target_region_id) return root;
-        root = target_region_id < root->region_id ? root->left : root->right;
+        if (target_region_id < root->region_id) {
+            root = root->left;
+        } else {
+            root = root->right;
+        }
     }
     return NULL;
 }
 
-void bst_inorder(const BSTNode *root, BSTVisitor visitor, void *user_data) {
-    if (root != NULL) {
-        bst_inorder(root->left, visitor, user_data);
-        visitor(root, user_data);
-        bst_inorder(root->right, visitor, user_data);
+static void bst_inorder(const BSTNode *root, const BSTNode *nodes[], int *count) {
+    if (root == NULL || *count >= 30) {
+        return;
     }
+
+    bst_inorder(root->left, nodes, count);
+    if (*count < 30) {
+        nodes[*count] = root;
+        (*count)++;
+    }
+    bst_inorder(root->right, nodes, count);
 }
 
 int bst_count(const BSTNode *root) {
@@ -305,7 +275,10 @@ int bst_height(const BSTNode *root) {
     if (root == NULL) return 0;
     int left_h = bst_height(root->left);
     int right_h = bst_height(root->right);
-    return 1 + (left_h > right_h ? left_h : right_h);
+    if (left_h > right_h) {
+        return 1 + left_h;
+    }
+    return 1 + right_h;
 }
 
 void bst_free(BSTNode *root) {
@@ -316,8 +289,10 @@ void bst_free(BSTNode *root) {
     }
 }
 
+/* gui */
+
 const char *sensor_region_name(int region_id) {
-    if (region_id >= 1 && region_id <= REGION_COUNT) return REGION_NAMES[region_id - 1];
+    if (region_id >= 1 && region_id <= 30) return REGION_NAMES[region_id - 1];
     return "Unknown Region";
 }
 
@@ -336,7 +311,7 @@ static double random_double(double min_val, double max_val) {
 }
 
 void sensor_generate_reading(SensorReading *out_reading) {
-    int region_id = (rand() % REGION_COUNT) + 1;
+    int region_id = (rand() % 30) + 1;
     double pm25;
     int spike_roll = rand() % 100;
 
@@ -361,16 +336,16 @@ static void format_time_label(long timestamp, char *buffer, size_t buffer_size) 
 }
 
 static void push_history(AppState *s, double aqi) {
-    if (s->history_count < SPARKLINE_POINTS) {
+    if (s->history_count < 90) {
         s->history[s->history_count++] = aqi;
     } else {
-        for (int i = 1; i < SPARKLINE_POINTS; i++) s->history[i - 1] = s->history[i];
-        s->history[SPARKLINE_POINTS - 1] = aqi;
+        for (int i = 1; i < 90; i++) s->history[i - 1] = s->history[i];
+        s->history[90 - 1] = aqi;
     }
 }
 
 static void update_kpi_labels(AppState *s) {
-    char buf[64];
+    char buf[128];
     snprintf(buf, sizeof(buf), "%ld", s->total_records);
     SetWindowText(s->hwnd_lbl_kpi_total, buf);
 
@@ -380,15 +355,22 @@ static void update_kpi_labels(AppState *s) {
     snprintf(buf, sizeof(buf), "%d", bst_count(s->bst_root));
     SetWindowText(s->hwnd_lbl_kpi_regions, buf);
 
-    double avg = s->total_records > 0 ? (double)s->sum_aqi_all / (double)s->total_records : 0.0;
+    double avg = 0.0;
+    if (s->total_records > 0) {
+        avg = (double)s->sum_aqi_all / (double)s->total_records;
+    }
     snprintf(buf, sizeof(buf), "%.1f", avg);
     SetWindowText(s->hwnd_lbl_kpi_avg, buf);
 
     snprintf(buf, sizeof(buf), "%d", s->peak_aqi_all);
     SetWindowText(s->hwnd_lbl_kpi_peak, buf);
 
+    const char *feed_status = "PAUSED";
+    if (s->running) {
+        feed_status = "STREAM ACTIVE";
+    }
     snprintf(buf, sizeof(buf), " Status: %s  |  Total Ingested: %ld  |  Alert Heap Size: %d  |  Active BST Nodes: %d",
-             s->running ? "STREAM ACTIVE" : "PAUSED",
+             feed_status,
              s->total_records, s->heap.size, bst_count(s->bst_root));
     SetWindowText(s->hwnd_status, buf);
 
@@ -408,7 +390,6 @@ static void add_listview_row(HWND hwnd_lv, const char* col0, const char* col1, c
     if (col4) ListView_SetItemText(hwnd_lv, 0, 4, (LPSTR)col4);
 }
 
-
 static int ci_strcmp(const char *a, const char *b) {
     while (*a && *b) {
         int ca = tolower((unsigned char)*a), cb = tolower((unsigned char)*b);
@@ -418,17 +399,6 @@ static int ci_strcmp(const char *a, const char *b) {
     return (unsigned char)*a - (unsigned char)*b;
 }
 
-static int compare_alert_desc(const void *a, const void *b) {
-    const AlertNode *na = (const AlertNode *)a;
-    const AlertNode *nb = (const AlertNode *)b;
-    return nb->aqi - na->aqi;
-}
-
-
-
-
-
-
 static void refresh_alerts_listview(AppState *s) {
     ListView_DeleteAllItems(s->hwnd_lv_alerts);
     if (heap_is_empty(&s->heap)) return;
@@ -437,16 +407,20 @@ static void refresh_alerts_listview(AppState *s) {
     AlertNode *sorted = (AlertNode *)malloc((size_t)n * sizeof(AlertNode));
     if (!sorted) return;
     memcpy(sorted, s->heap.tree, (size_t)n * sizeof(AlertNode));
-    qsort(sorted, (size_t)n, sizeof(AlertNode), compare_alert_desc);
+    AlertHeap sorted_heap;
+    sorted_heap.tree = sorted;
+    sorted_heap.size = n;
+    sorted_heap.capacity = n;
 
     int count = 0;
-    for (int i = 0; i < n; i++) {
-        const char *rname = sensor_region_name(sorted[i].region_id);
+    while (!heap_is_empty(&sorted_heap)) {
+        AlertNode alert = heap_extract_max(&sorted_heap);
+        const char *rname = sensor_region_name(alert.region_id);
 
         char time_buf[16], pm_buf[32], aqi_buf[32];
-        format_time_label(sorted[i].timestamp, time_buf, sizeof(time_buf));
-        snprintf(pm_buf, sizeof(pm_buf), "%.1f", sorted[i].pm25);
-        snprintf(aqi_buf, sizeof(aqi_buf), "%d", sorted[i].aqi);
+        format_time_label(alert.timestamp, time_buf, sizeof(time_buf));
+        snprintf(pm_buf, sizeof(pm_buf), "%.1f", alert.pm25);
+        snprintf(aqi_buf, sizeof(aqi_buf), "%d", alert.aqi);
 
         LVITEM lvi = { 0 };
         lvi.mask = LVIF_TEXT;
@@ -457,18 +431,12 @@ static void refresh_alerts_listview(AppState *s) {
         ListView_SetItemText(s->hwnd_lv_alerts, idx, 1, (LPSTR)rname);
         ListView_SetItemText(s->hwnd_lv_alerts, idx, 2, aqi_buf);
         ListView_SetItemText(s->hwnd_lv_alerts, idx, 3, pm_buf);
-        ListView_SetItemText(s->hwnd_lv_alerts, idx, 4, (LPSTR)sensor_aqi_category(sorted[i].aqi));
+        ListView_SetItemText(s->hwnd_lv_alerts, idx, 4, (LPSTR)sensor_aqi_category(alert.aqi));
 
         count++;
     }
-    free(sorted);
+    free(sorted_heap.tree);
 }
-
-
-
-
-
-
 
 typedef struct {
     char line1[128];
@@ -506,7 +474,7 @@ static void toast_remove(HWND hwnd) {
 }
 
 static void show_toast_alert(const char *region_name, int region_id, int aqi, double pm25, const char *category) {
-    if (g_app.toast_count >= MAX_TOASTS) {
+    if (g_app.toast_count >= 5) {
         DestroyWindow(g_app.toast_hwnds[0]); 
     }
 
@@ -514,7 +482,10 @@ static void show_toast_alert(const char *region_name, int region_id, int aqi, do
     if (!data) return;
     snprintf(data->line1, sizeof(data->line1), "%s  |  AQI %d (%s)", region_name, aqi, category);
     snprintf(data->line2, sizeof(data->line2), "PM2.5 %.1f ug/m3   -   Region ID %d", pm25, region_id);
-    data->accent = (aqi > 400) ? RGB(159, 18, 57) : COLOR_ACCENT_RED;
+    data->accent = RGB(225, 29, 72);
+    if (aqi > 400) {
+        data->accent = RGB(159, 18, 57);
+    }
 
     RECT work;
     SystemParametersInfo(SPI_GETWORKAREA, 0, &work, 0);
@@ -528,7 +499,7 @@ static void show_toast_alert(const char *region_name, int region_id, int aqi, do
     if (toast) {
         g_app.toast_hwnds[g_app.toast_count++] = toast;
         toast_reposition_all();
-        SetTimer(toast, ID_TOAST_TIMER, 4500, NULL);
+        SetTimer(toast, 1, 4500, NULL);
     } else {
         free(data);
     }
@@ -542,7 +513,7 @@ static void ingest_reading(AppState *s, SensorReading reading) {
 
     add_listview_row(s->hwnd_lv_recent, time_buf, sensor_region_name(reading.region_id), pm_buf, aqi_buf, sensor_aqi_category(reading.aqi));
 
-    if (ListView_GetItemCount(s->hwnd_lv_recent) > RECENT_ROWS_LIMIT) {
+    if (ListView_GetItemCount(s->hwnd_lv_recent) > 200) {
         ListView_DeleteItem(s->hwnd_lv_recent, ListView_GetItemCount(s->hwnd_lv_recent) - 1);
     }
 
@@ -570,7 +541,7 @@ static void ingest_reading(AppState *s, SensorReading reading) {
     push_history(s, (double)reading.aqi);
     InvalidateRect(s->hwnd_sparkline, NULL, FALSE);
 
-    if (reading.aqi > ALERT_THRESHOLD_AQI) {
+    if (reading.aqi > 300) {
         heap_insert(&s->heap, reading.region_id, reading.aqi, reading.pm25, reading.timestamp);
         refresh_alerts_listview(s);
 
@@ -612,15 +583,15 @@ static LRESULT CALLBACK SparklineWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
 
             HPEN threshPen = CreatePen(PS_DASH, 1, RGB(225, 29, 72));
             oldPen = SelectObject(memDC, threshPen);
-            int thresh_y = height - (int)(((double)ALERT_THRESHOLD_AQI / 500.0) * (height - 10));
+            int thresh_y = height - (int)(((double)300 / 500.0) * (height - 10));
             MoveToEx(memDC, 0, thresh_y, NULL);
             LineTo(memDC, width, thresh_y);
             SelectObject(memDC, oldPen);
             DeleteObject(threshPen);
 
             if (g_app.history_count >= 2) {
-                POINT pts[SPARKLINE_POINTS + 2];
-                double step_x = (double)width / (double)(SPARKLINE_POINTS - 1);
+                POINT pts[90 + 2];
+                double step_x = (double)width / (double)(90 - 1);
 
                 for (int i = 0; i < g_app.history_count; i++) {
                     double val = g_app.history[i];
@@ -641,7 +612,7 @@ static LRESULT CALLBACK SparklineWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 DeleteObject(fillBrush);
                 DeleteObject(nullPen);
 
-                HPEN linePen = CreatePen(PS_SOLID, 2, COLOR_PRIMARY);
+                HPEN linePen = CreatePen(PS_SOLID, 2, RGB(37, 99, 235));
                 oldPen = SelectObject(memDC, linePen);
                 Polyline(memDC, pts, g_app.history_count);
                 SelectObject(memDC, oldPen);
@@ -673,11 +644,11 @@ static LRESULT CALLBACK AQIPanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             RECT rect;
             GetClientRect(hwnd, &rect);
 
-            HBRUSH bgBrush = CreateSolidBrush(COLOR_CARD_BG);
+            HBRUSH bgBrush = CreateSolidBrush(RGB(255, 255, 255));
             FillRect(hdc, &rect, bgBrush);
             DeleteObject(bgBrush);
 
-            HPEN borderPen = CreatePen(PS_SOLID, 1, COLOR_BORDER);
+            HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(226, 232, 240));
             HGDIOBJ oldPen = SelectObject(hdc, borderPen);
             HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
             RoundRect(hdc, 0, 0, rect.right, rect.bottom, 18, 18);
@@ -728,7 +699,14 @@ static LRESULT CALLBACK HeaderWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             SetTextColor(hdc, RGB(148, 163, 184));
             TextOutA(hdc, 220, 17, "Enterprise AQI Telemetry & Emergency Alert Platform", 51);
 
-            COLORREF status_color = g_app.running ? COLOR_ACCENT_GREEN : RGB(100, 116, 139);
+            COLORREF status_color = RGB(100, 116, 139);
+            const char *status_text = "OFFLINE";
+            int status_text_length = 7;
+            if (g_app.running) {
+                status_color = RGB(16, 185, 129);
+                status_text = "STREAM LIVE";
+                status_text_length = 11;
+            }
             HBRUSH dotBrush = CreateSolidBrush(status_color);
             HGDIOBJ oldB = SelectObject(hdc, dotBrush);
             HPEN nullP = CreatePen(PS_NULL, 0, 0);
@@ -738,7 +716,7 @@ static LRESULT CALLBACK HeaderWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 
             SelectObject(hdc, g_app.font_bold);
             SetTextColor(hdc, status_color);
-            TextOutA(hdc, rect.right - 120, 15, g_app.running ? "STREAM LIVE" : "OFFLINE", g_app.running ? 11 : 7);
+            TextOutA(hdc, rect.right - 120, 15, status_text, status_text_length);
 
             SelectObject(hdc, oldB);
             SelectObject(hdc, oldP);
@@ -787,12 +765,12 @@ static LRESULT CALLBACK ToastWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 SetBkMode(hdc, TRANSPARENT);
                 RECT text1 = { 18, 10, rect.right - 10, 42 };
                 SelectObject(hdc, g_app.font_bold);
-                SetTextColor(hdc, COLOR_TEXT_DARK);
+                SetTextColor(hdc, RGB(15, 23, 42));
                 DrawText(hdc, data->line1, -1, &text1, DT_LEFT | DT_WORDBREAK);
 
                 RECT text2 = { 18, 44, rect.right - 10, 70 };
                 SelectObject(hdc, g_app.font_sub);
-                SetTextColor(hdc, COLOR_TEXT_MUTED);
+                SetTextColor(hdc, RGB(100, 116, 139));
                 DrawText(hdc, data->line2, -1, &text2, DT_LEFT | DT_WORDBREAK);
             }
 
@@ -820,19 +798,6 @@ static LRESULT CALLBACK ToastWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-
-
-
-
-
-
-
-typedef struct {
-    HWND hwnd;
-    int col;
-    BOOL ascending;
-} SortCtx;
-
 typedef struct {
     int col;
     BOOL ascending;
@@ -842,19 +807,78 @@ static SortState g_sort_recent = { -1, TRUE };
 static SortState g_sort_alerts = { -1, TRUE };
 static SortState g_sort_report = { -1, TRUE };
 
-static int CALLBACK generic_sort_compare(LPARAM lParam1, LPARAM lParam2, LPARAM lParamSort) {
-    SortCtx *ctx = (SortCtx *)lParamSort;
-    char buf1[128], buf2[128];
-    ListView_GetItemText(ctx->hwnd, (int)lParam1, ctx->col, buf1, sizeof(buf1));
-    ListView_GetItemText(ctx->hwnd, (int)lParam2, ctx->col, buf2, sizeof(buf2));
+static BOOL is_numeric_column(HWND list, int column) {
+    if (list == g_app.hwnd_lv_recent) {
+        return column == 2 || column == 3;
+    }
+    if (list == g_app.hwnd_lv_alerts) {
+        return column == 2 || column == 3;
+    }
+    if (list == g_app.hwnd_lv_report) {
+        return column == 0 || column == 2 || column == 4 ||
+               column == 5 || column == 6;
+    }
+    return FALSE;
+}
 
-    char *end1, *end2;
-    double n1 = strtod(buf1, &end1);
-    double n2 = strtod(buf2, &end2);
-    BOOL numeric = (buf1[0] != '\0' && buf2[0] != '\0' && *end1 == '\0' && *end2 == '\0');
+static int compare_listview_rows(HWND list, int first_row, int second_row,
+                                 int column, BOOL ascending) {
+    char first_text[128];
+    char second_text[128];
+    int result;
 
-    int result = numeric ? (n1 < n2 ? -1 : (n1 > n2 ? 1 : 0)) : ci_strcmp(buf1, buf2);
-    return ctx->ascending ? result : -result;
+    ListView_GetItemText(list, first_row, column, first_text, sizeof(first_text));
+    ListView_GetItemText(list, second_row, column, second_text, sizeof(second_text));
+
+    if (is_numeric_column(list, column)) {
+        double first_number = atof(first_text);
+        double second_number = atof(second_text);
+        if (first_number < second_number) {
+            result = -1;
+        } else if (first_number > second_number) {
+            result = 1;
+        } else {
+            result = 0;
+        }
+    } else {
+        result = ci_strcmp(first_text, second_text);
+    }
+
+    if (!ascending) {
+        result = -result;
+    }
+    return result;
+}
+
+static void swap_listview_rows(HWND list, int first_row, int second_row) {
+    char first_values[8][128];
+    char second_values[8][128];
+    int column_count = 5;
+    UINT first_state;
+    UINT second_state;
+    UINT state_mask = LVIS_SELECTED | LVIS_FOCUSED;
+
+    if (list == g_app.hwnd_lv_report) {
+        column_count = 8;
+    }
+
+    first_state = ListView_GetItemState(list, first_row, state_mask);
+    second_state = ListView_GetItemState(list, second_row, state_mask);
+
+    for (int column = 0; column < column_count; column++) {
+        ListView_GetItemText(list, first_row, column, first_values[column],
+                             sizeof(first_values[column]));
+        ListView_GetItemText(list, second_row, column, second_values[column],
+                             sizeof(second_values[column]));
+    }
+
+    for (int column = 0; column < column_count; column++) {
+        ListView_SetItemText(list, first_row, column, second_values[column]);
+        ListView_SetItemText(list, second_row, column, first_values[column]);
+    }
+
+    ListView_SetItemState(list, first_row, second_state, state_mask);
+    ListView_SetItemState(list, second_row, first_state, state_mask);
 }
 
 static void handle_column_click(HWND hwndLV, int col) {
@@ -867,8 +891,16 @@ static void handle_column_click(HWND hwndLV, int col) {
     if (state->col == col) state->ascending = !state->ascending;
     else { state->col = col; state->ascending = TRUE; }
 
-    SortCtx ctx = { hwndLV, col, state->ascending };
-    ListView_SortItemsEx(hwndLV, generic_sort_compare, (LPARAM)&ctx);
+    int item_count = ListView_GetItemCount(hwndLV);
+    for (int i = 0; i < item_count - 1; i++) {
+        for (int row = 0; row < item_count - i - 1; row++) {
+            int comparison = compare_listview_rows(hwndLV, row, row + 1,
+                                                   col, state->ascending);
+            if (comparison > 0) {
+                swap_listview_rows(hwndLV, row, row + 1);
+            }
+        }
+    }
 }
 
 static void apply_unified_theme(HWND hwnd, HFONT font) {
@@ -882,10 +914,10 @@ static void style_listview_modern(HWND hwnd_lv) {
     SetWindowTheme(hwnd_lv, L"Explorer", NULL);
     DWORD ex_style = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP;
     ListView_SetExtendedListViewStyleEx(hwnd_lv, ex_style, ex_style);
-    ListView_SetBkColor(hwnd_lv, COLOR_CARD_BG);
-    ListView_SetTextBkColor(hwnd_lv, COLOR_CARD_BG);
-    ListView_SetTextColor(hwnd_lv, COLOR_TEXT_DARK);
-    ListView_SetOutlineColor(hwnd_lv, COLOR_BORDER);
+    ListView_SetBkColor(hwnd_lv, RGB(255, 255, 255));
+    ListView_SetTextBkColor(hwnd_lv, RGB(255, 255, 255));
+    ListView_SetTextColor(hwnd_lv, RGB(15, 23, 42));
+    ListView_SetOutlineColor(hwnd_lv, RGB(226, 232, 240));
 }
 
 static void create_listview_columns(HWND hwnd_lv, const char* cols[], int count) {
@@ -914,9 +946,9 @@ typedef struct {
 } BSTLayoutEntry;
 
 static void collect_bst_layout(const BSTNode *node, int depth, BSTLayoutEntry entries[], int *count) {
-    if (!node || *count >= REGION_COUNT) return;
+    if (!node || *count >= 30) return;
     collect_bst_layout(node->left, depth + 1, entries, count);
-    if (*count < REGION_COUNT) {
+    if (*count < 30) {
         entries[*count].node = node;
         entries[*count].depth = depth;
         (*count)++;
@@ -938,6 +970,10 @@ static int find_bst_search_step(const BSTNode *node) {
     return -1;
 }
 
+static int scale_bst_value(int value) {
+    return (value * g_app.bst_tree_zoom_percent + 50) / 100;
+}
+
 static BOOL bst_search_edge_visited(const BSTNode *parent, const BSTNode *child) {
     int last = g_app.bst_search_step;
     if (last >= g_app.bst_search_path_count) last = g_app.bst_search_path_count - 1;
@@ -955,10 +991,19 @@ static void update_bst_scrollbars(HWND hwnd, const BSTLayoutEntry entries[], int
         if (entries[i].depth > max_depth) max_depth = entries[i].depth;
     }
 
-    int content_width = count > 0 ? 80 + (count - 1) * 88 : client.right;
+    int content_width = client.right;
+    if (count > 0) {
+        content_width = scale_bst_value(80 + (count - 1) * 88);
+    }
     if (content_width < client.right) content_width = client.right;
-    int content_height = count > 0 ? 76 + max_depth * 82 : client.bottom;
-    int page_height = client.bottom > 40 ? client.bottom - 40 : 1;
+    int content_height = client.bottom;
+    if (count > 0) {
+        content_height = scale_bst_value(76 + max_depth * 82);
+    }
+    int page_height = 1;
+    if (client.bottom > 40) {
+        page_height = client.bottom - 40;
+    }
     if (content_height < page_height) content_height = page_height;
 
     SCROLLINFO si = { 0 };
@@ -966,7 +1011,10 @@ static void update_bst_scrollbars(HWND hwnd, const BSTLayoutEntry entries[], int
     si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
     si.nMin = 0;
     si.nMax = content_width - 1;
-    si.nPage = (UINT)(client.right > 0 ? client.right : 1);
+    si.nPage = (UINT)client.right;
+    if (si.nPage == 0) {
+        si.nPage = 1;
+    }
     si.nPos = g_app.bst_tree_scroll_x;
     SetScrollInfo(hwnd, SB_HORZ, &si, TRUE);
     GetScrollInfo(hwnd, SB_HORZ, &si);
@@ -996,10 +1044,18 @@ static void scroll_bst_tree(HWND hwnd, int bar, UINT request) {
             position += 44;
             break;
         case SB_PAGELEFT:
-            position -= page > 0 ? page : 44;
+            if (page > 0) {
+                position -= page;
+            } else {
+                position -= 44;
+            }
             break;
         case SB_PAGERIGHT:
-            position += page > 0 ? page : 44;
+            if (page > 0) {
+                position += page;
+            } else {
+                position += 44;
+            }
             break;
         case SB_THUMBPOSITION:
         case SB_THUMBTRACK:
@@ -1039,21 +1095,33 @@ static void update_bst_search_status(void) {
             snprintf(status, sizeof(status), "Step %d/%d: target Zone %d matches this node.",
                      g_app.bst_search_step + 1, g_app.bst_search_path_count, g_app.bst_search_target);
         } else {
+            const char *comparison = "greater than";
+            const char *direction = "RIGHT";
+            if (g_app.bst_search_target < node->region_id) {
+                comparison = "less than";
+                direction = "LEFT";
+            }
             snprintf(status, sizeof(status), "Step %d/%d: target Zone %d is %s Zone %d; go %s.",
                      g_app.bst_search_step + 1, g_app.bst_search_path_count,
                      g_app.bst_search_target,
-                     g_app.bst_search_target < node->region_id ? "less than" : "greater than",
-                     node->region_id,
-                     g_app.bst_search_target < node->region_id ? "LEFT" : "RIGHT");
+                     comparison, node->region_id, direction);
         }
     } else if (g_app.bst_search_result) {
+        const char *plural = "";
+        if (g_app.bst_search_path_count != 1) {
+            plural = "s";
+        }
         snprintf(status, sizeof(status), "Search complete: Zone %d found in %d comparison%s.",
                  g_app.bst_search_target, g_app.bst_search_path_count,
-                 g_app.bst_search_path_count == 1 ? "" : "s");
+                 plural);
     } else {
+        const char *plural = "";
+        if (g_app.bst_search_path_count != 1) {
+            plural = "s";
+        }
         snprintf(status, sizeof(status), "Search complete: Zone %d was not found after %d comparison%s.",
                  g_app.bst_search_target, g_app.bst_search_path_count,
-                 g_app.bst_search_path_count == 1 ? "" : "s");
+                 plural);
     }
     SetWindowTextA(g_app.hwnd_lbl_bst_step, status);
 }
@@ -1064,8 +1132,41 @@ static void set_archive_details(const char *text) {
     SendMessage(g_app.hwnd_edit_search_info, EM_SCROLLCARET, 0, 0);
 }
 
+static void set_bst_zoom(int zoom_percent) {
+    if (zoom_percent < 50) zoom_percent = 50;
+    if (zoom_percent > 200) zoom_percent = 200;
+    g_app.bst_tree_zoom_percent = zoom_percent;
+
+    BSTLayoutEntry entries[30];
+    int count = 0;
+    collect_bst_layout(g_app.bst_root, 0, entries, &count);
+    update_bst_scrollbars(g_app.hwnd_bst_tree, entries, count);
+    InvalidateRect(g_app.hwnd_bst_tree, NULL, FALSE);
+}
+
+static void zoom_bst_with_wheel(WPARAM wParam) {
+    short wheel_delta = (short)HIWORD(wParam);
+    if (wheel_delta > 0) {
+        set_bst_zoom(g_app.bst_tree_zoom_percent + 25);
+    } else if (wheel_delta < 0) {
+        set_bst_zoom(g_app.bst_tree_zoom_percent - 25);
+    }
+}
+
+static BOOL mouse_pointer_over_bst_tree(LPARAM lParam) {
+    POINT point;
+    RECT tree_rect;
+
+    point.x = (short)LOWORD(lParam);
+    point.y = (short)HIWORD(lParam);
+    if (!GetWindowRect(g_app.hwnd_bst_tree, &tree_rect)) {
+        return FALSE;
+    }
+    return PtInRect(&tree_rect, point);
+}
+
 static void start_bst_search(int target_region_id) {
-    KillTimer(g_app.hwnd_main, TIMER_BST_SEARCH);
+    KillTimer(g_app.hwnd_main, 1002);
     g_app.bst_search_target = target_region_id;
     g_app.bst_search_result = NULL;
     g_app.bst_search_step = 0;
@@ -1075,7 +1176,7 @@ static void start_bst_search(int target_region_id) {
 
     update_bst_search_status();
     InvalidateRect(g_app.hwnd_bst_tree, NULL, FALSE);
-    if (g_app.bst_search_path_count > 0 && !SetTimer(g_app.hwnd_main, TIMER_BST_SEARCH, 650, NULL)) {
+    if (g_app.bst_search_path_count > 0 && !SetTimer(g_app.hwnd_main, 1002, 650, NULL)) {
         SetWindowTextA(g_app.hwnd_lbl_bst_step, "Unable to animate the BST search because its timer could not be started.");
         MessageBoxA(g_app.hwnd_main, "The BST search could not be animated because the timer could not be started.",
                     "BST Animation Error", MB_OK | MB_ICONERROR);
@@ -1085,7 +1186,7 @@ static void start_bst_search(int target_region_id) {
 static LRESULT CALLBACK BSTTreeWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_ERASEBKGND) return 1;
     if (msg == WM_SIZE) {
-        BSTLayoutEntry entries[REGION_COUNT];
+        BSTLayoutEntry entries[30];
         int count = 0;
         collect_bst_layout(g_app.bst_root, 0, entries, &count);
         update_bst_scrollbars(hwnd, entries, count);
@@ -1100,6 +1201,13 @@ static LRESULT CALLBACK BSTTreeWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         scroll_bst_tree(hwnd, SB_VERT, LOWORD(wParam));
         return 0;
     }
+    if (msg == WM_MOUSEWHEEL) {
+        if (mouse_pointer_over_bst_tree(lParam)) {
+            zoom_bst_with_wheel(wParam);
+            return 0;
+        }
+        return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
     if (msg != WM_PAINT) return DefWindowProc(hwnd, msg, wParam, lParam);
 
     PAINTSTRUCT ps;
@@ -1108,7 +1216,7 @@ static LRESULT CALLBACK BSTTreeWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     GetClientRect(hwnd, &bounds);
     FillRect(hdc, &bounds, g_app.brush_card);
 
-    HPEN border_pen = CreatePen(PS_SOLID, 1, COLOR_BORDER);
+    HPEN border_pen = CreatePen(PS_SOLID, 1, RGB(226, 232, 240));
     HGDIOBJ old_pen = SelectObject(hdc, border_pen);
     HGDIOBJ old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
     RoundRect(hdc, bounds.left, bounds.top, bounds.right, bounds.bottom, 12, 12);
@@ -1117,13 +1225,13 @@ static LRESULT CALLBACK BSTTreeWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     DeleteObject(border_pen);
 
     SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, COLOR_TEXT_MUTED);
+    SetTextColor(hdc, RGB(100, 116, 139));
     SelectObject(hdc, g_app.font_sub);
     const char *tree_title = "BINARY SEARCH TREE  |  REGION ID ORDER";
     TextOutA(hdc, 16, 10, tree_title, (int)strlen(tree_title));
 
     const COLORREF legend_colors[] = {
-        RGB(219, 234, 254), COLOR_PRIMARY, RGB(254, 243, 199), RGB(209, 250, 229)
+        RGB(219, 234, 254), RGB(37, 99, 235), RGB(254, 243, 199), RGB(209, 250, 229)
     };
     const char *legend_labels[] = { "Node", "Visited", "Current", "Found" };
     int legend_x = bounds.right - 335;
@@ -1132,17 +1240,21 @@ static LRESULT CALLBACK BSTTreeWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         HBRUSH swatch_brush = CreateSolidBrush(legend_colors[i]);
         FillRect(hdc, &swatch, swatch_brush);
         DeleteObject(swatch_brush);
-        SetTextColor(hdc, COLOR_TEXT_MUTED);
+        SetTextColor(hdc, RGB(100, 116, 139));
         TextOutA(hdc, legend_x + 17, 10, legend_labels[i], (int)strlen(legend_labels[i]));
-        legend_x += i == 0 ? 64 : 78;
+        if (i == 0) {
+            legend_x += 64;
+        } else {
+            legend_x += 78;
+        }
     }
 
-    BSTLayoutEntry entries[REGION_COUNT];
+    BSTLayoutEntry entries[30];
     int count = 0;
     collect_bst_layout(g_app.bst_root, 0, entries, &count);
     update_bst_scrollbars(hwnd, entries, count);
     if (count == 0) {
-        SetTextColor(hdc, COLOR_TEXT_MUTED);
+        SetTextColor(hdc, RGB(100, 116, 139));
         SelectObject(hdc, g_app.font_body);
         const char *empty_text = "Start the live feed to populate the zone index.";
         RECT text_rect = { 16, 45, bounds.right - 16, bounds.bottom - 12 };
@@ -1155,12 +1267,15 @@ static LRESULT CALLBACK BSTTreeWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     for (int i = 0; i < count; i++) {
         if (entries[i].depth > max_depth) max_depth = entries[i].depth;
     }
-    int content_width = count > 0 ? 80 + (count - 1) * 88 : bounds.right;
+    int content_width = scale_bst_value(80 + (count - 1) * 88);
     if (content_width < bounds.right) content_width = bounds.right;
-    int left_padding = (content_width - (count - 1) * 88 - 80) / 2 + 40;
+    int left_padding = (content_width - scale_bst_value((count - 1) * 88) -
+                        scale_bst_value(80)) / 2 + scale_bst_value(40);
+    int node_radius = scale_bst_value(14);
+    if (node_radius < 7) node_radius = 7;
     for (int i = 0; i < count; i++) {
-        entries[i].x = left_padding + i * 88 - g_app.bst_tree_scroll_x;
-        entries[i].y = 48 + entries[i].depth * 82 - g_app.bst_tree_scroll_y;
+        entries[i].x = left_padding + scale_bst_value(i * 88) - g_app.bst_tree_scroll_x;
+        entries[i].y = scale_bst_value(48 + entries[i].depth * 82) - g_app.bst_tree_scroll_y;
     }
 
     RECT diagram_clip = { 0, 38, bounds.right, bounds.bottom };
@@ -1174,7 +1289,7 @@ static LRESULT CALLBACK BSTTreeWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             int child_pos = find_bst_layout_entry(entries, count, children[child_index]);
             if (child_pos < 0) continue;
             if (bst_search_edge_visited(entries[i].node, children[child_index])) {
-                HPEN active_pen = CreatePen(PS_SOLID, 2, COLOR_PRIMARY);
+                HPEN active_pen = CreatePen(PS_SOLID, 2, RGB(37, 99, 235));
                 SelectObject(hdc, active_pen);
                 MoveToEx(hdc, entries[i].x, entries[i].y, NULL);
                 LineTo(hdc, entries[child_pos].x, entries[child_pos].y);
@@ -1192,10 +1307,10 @@ static LRESULT CALLBACK BSTTreeWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     for (int i = 0; i < count; i++) {
         int path_step = find_bst_search_step(entries[i].node);
         COLORREF fill = RGB(219, 234, 254);
-        COLORREF outline = COLOR_PRIMARY;
-        COLORREF text = COLOR_TEXT_DARK;
+        COLORREF outline = RGB(37, 99, 235);
+        COLORREF text = RGB(15, 23, 42);
         if (path_step >= 0 && path_step < g_app.bst_search_step) {
-            fill = COLOR_PRIMARY;
+            fill = RGB(37, 99, 235);
             text = RGB(255, 255, 255);
         }
         if (path_step >= 0 && path_step == g_app.bst_search_step &&
@@ -1206,7 +1321,7 @@ static LRESULT CALLBACK BSTTreeWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         } else if (g_app.bst_search_result == entries[i].node &&
                    g_app.bst_search_step >= g_app.bst_search_path_count) {
             fill = RGB(209, 250, 229);
-            outline = COLOR_ACCENT_GREEN;
+            outline = RGB(16, 185, 129);
             text = RGB(6, 78, 59);
         }
 
@@ -1214,7 +1329,8 @@ static LRESULT CALLBACK BSTTreeWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         HPEN node_pen = CreatePen(PS_SOLID, 2, outline);
         HGDIOBJ previous_brush = SelectObject(hdc, node_brush);
         HGDIOBJ previous_pen = SelectObject(hdc, node_pen);
-        Ellipse(hdc, entries[i].x - 14, entries[i].y - 14, entries[i].x + 14, entries[i].y + 14);
+        Ellipse(hdc, entries[i].x - node_radius, entries[i].y - node_radius,
+                entries[i].x + node_radius, entries[i].y + node_radius);
         SelectObject(hdc, previous_brush);
         SelectObject(hdc, previous_pen);
         DeleteObject(node_brush);
@@ -1222,12 +1338,22 @@ static LRESULT CALLBACK BSTTreeWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
         char node_label[8];
         snprintf(node_label, sizeof(node_label), "%d", entries[i].node->region_id);
+        HFONT node_font = CreateFontA(scale_bst_value(15), 0, 0, 0, FW_SEMIBOLD,
+                                      FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                      CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
+        HGDIOBJ previous_font;
+        if (node_font) {
+            previous_font = SelectObject(hdc, node_font);
+        } else {
+            previous_font = SelectObject(hdc, g_app.font_bold);
+        }
         SIZE label_size;
         GetTextExtentPoint32A(hdc, node_label, (int)strlen(node_label), &label_size);
         SetTextColor(hdc, text);
-        SelectObject(hdc, g_app.font_bold);
         TextOutA(hdc, entries[i].x - label_size.cx / 2, entries[i].y - label_size.cy / 2,
                  node_label, (int)strlen(node_label));
+        SelectObject(hdc, previous_font);
+        if (node_font) DeleteObject(node_font);
     }
 
     EndPaint(hwnd, &ps);
@@ -1239,7 +1365,7 @@ static HWND create_kpi_card(HWND parent, int x, int y, int w, int h, const char*
 
     HWND lbl_title = CreateWindow("STATIC", title, WS_CHILD | WS_VISIBLE, 15, 12, w - 30, 18, panel, NULL, NULL, NULL);
     SendMessage(lbl_title, WM_SETFONT, (WPARAM)g_app.font_sub, TRUE);
-    SetWindowLongPtr(lbl_title, GWLP_USERDATA, (LONG_PTR)COLOR_TEXT_MUTED);
+    SetWindowLongPtr(lbl_title, GWLP_USERDATA, (LONG_PTR)RGB(100, 116, 139));
     apply_unified_theme(lbl_title, g_app.font_sub);
 
     *out_val_hwnd = CreateWindow("STATIC", "0", WS_CHILD | WS_VISIBLE, 15, 32, w - 30, 32, panel, NULL, NULL, NULL);
@@ -1254,9 +1380,9 @@ static HWND create_kpi_card(HWND parent, int x, int y, int w, int h, const char*
 static void build_dashboard_page(HWND parent) {
     g_app.hwnd_panel_dash = CreateWindow("AQIPanelClass", "", WS_CHILD | WS_VISIBLE, 15, 110, 1135, 540, parent, NULL, NULL, NULL);
 
-    create_kpi_card(g_app.hwnd_panel_dash, 0, 0, 210, 75, "TOTAL TELEMETRY READINGS", &g_app.hwnd_lbl_kpi_total, COLOR_PRIMARY);
-    create_kpi_card(g_app.hwnd_panel_dash, 225, 0, 210, 75, "CRITICAL ALERTS IN HEAP", &g_app.hwnd_lbl_kpi_alerts, COLOR_ACCENT_RED);
-    create_kpi_card(g_app.hwnd_panel_dash, 450, 0, 210, 75, "ACTIVE MUMBAI ZONES", &g_app.hwnd_lbl_kpi_regions, COLOR_ACCENT_GREEN);
+    create_kpi_card(g_app.hwnd_panel_dash, 0, 0, 210, 75, "TOTAL TELEMETRY READINGS", &g_app.hwnd_lbl_kpi_total, RGB(37, 99, 235));
+    create_kpi_card(g_app.hwnd_panel_dash, 225, 0, 210, 75, "CRITICAL ALERTS IN HEAP", &g_app.hwnd_lbl_kpi_alerts, RGB(225, 29, 72));
+    create_kpi_card(g_app.hwnd_panel_dash, 450, 0, 210, 75, "ACTIVE MUMBAI ZONES", &g_app.hwnd_lbl_kpi_regions, RGB(16, 185, 129));
     create_kpi_card(g_app.hwnd_panel_dash, 675, 0, 210, 75, "NETWORK AVERAGE AQI", &g_app.hwnd_lbl_kpi_avg, RGB(217, 119, 6));
     create_kpi_card(g_app.hwnd_panel_dash, 900, 0, 225, 75, "PEAK AQI RECORDED", &g_app.hwnd_lbl_kpi_peak, RGB(147, 51, 234));
 
@@ -1279,7 +1405,7 @@ static void build_dashboard_page(HWND parent) {
 static void build_alerts_page(HWND parent) {
     g_app.hwnd_panel_alerts = CreateWindow("AQIPanelClass", "", WS_CHILD, 15, 110, 1135, 540, parent, NULL, NULL, NULL);
 
-    HWND btn_ext = CreateWindow("BUTTON", "Acknowledge Highest (Extract-Max)", WS_CHILD | WS_VISIBLE | BS_FLAT, 0, 0, 260, 32, g_app.hwnd_panel_alerts, (HMENU)ID_BTN_EXTRACT, NULL, NULL);
+    HWND btn_ext = CreateWindow("BUTTON", "Acknowledge Highest (Extract-Max)", WS_CHILD | WS_VISIBLE | BS_FLAT, 0, 0, 260, 32, g_app.hwnd_panel_alerts, (HMENU)2004, NULL, NULL);
     SendMessage(btn_ext, WM_SETFONT, (WPARAM)g_app.font_bold, TRUE);
     apply_unified_theme(btn_ext, g_app.font_bold);
 
@@ -1298,11 +1424,11 @@ static void build_archive_page(HWND parent) {
     SendMessage(lbl_sel, WM_SETFONT, (WPARAM)g_app.font_bold, TRUE);
     apply_unified_theme(lbl_sel, g_app.font_bold);
 
-    g_app.hwnd_combo_search = CreateWindow("COMBOBOX", "", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 145, 8, 300, 300, g_app.hwnd_panel_archive, (HMENU)ID_COMBO_SEARCH, NULL, NULL);
+    g_app.hwnd_combo_search = CreateWindow("COMBOBOX", "", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 145, 8, 300, 300, g_app.hwnd_panel_archive, (HMENU)2008, NULL, NULL);
     SendMessage(g_app.hwnd_combo_search, WM_SETFONT, (WPARAM)g_app.font_body, TRUE);
     apply_unified_theme(g_app.hwnd_combo_search, g_app.font_body);
 
-    HWND btn_sch = CreateWindow("BUTTON", "Search Index (BST)", WS_CHILD | WS_VISIBLE | BS_FLAT, 455, 7, 160, 30, g_app.hwnd_panel_archive, (HMENU)ID_BTN_SEARCH, NULL, NULL);
+    HWND btn_sch = CreateWindow("BUTTON", "Search Index (BST)", WS_CHILD | WS_VISIBLE | BS_FLAT, 455, 7, 160, 30, g_app.hwnd_panel_archive, (HMENU)2005, NULL, NULL);
     SendMessage(btn_sch, WM_SETFONT, (WPARAM)g_app.font_bold, TRUE);
     apply_unified_theme(btn_sch, g_app.font_bold);
 
@@ -1324,18 +1450,15 @@ static void build_archive_page(HWND parent) {
     apply_unified_theme(g_app.hwnd_edit_search_info, g_app.font_body);
 }
 
-typedef struct {
-    HWND lv;
-} ReportCtx;
-
-static void collect_report_row(const BSTNode *node, void *user_data) {
-    ReportCtx *ctx = (ReportCtx *)user_data;
-    HWND lv = ctx->lv;
+static void collect_report_row(const BSTNode *node, HWND lv) {
     const char *rname = sensor_region_name(node->region_id);
 
     char r_id[16], c_aqi[16], avg_aqi[32], peak[16], count[32], time_buf[16];
     format_time_label(node->timestamp, time_buf, sizeof(time_buf));
-    double avg = node->reading_count > 0 ? (double)node->sum_aqi / (double)node->reading_count : 0.0;
+    double avg = 0.0;
+    if (node->reading_count > 0) {
+        avg = (double)node->sum_aqi / (double)node->reading_count;
+    }
 
     snprintf(r_id, sizeof(r_id), "%d", node->region_id);
     snprintf(c_aqi, sizeof(c_aqi), "%d", node->aqi_val);
@@ -1361,7 +1484,7 @@ static void collect_report_row(const BSTNode *node, void *user_data) {
 static void build_reports_page(HWND parent) {
     g_app.hwnd_panel_reports = CreateWindow("AQIPanelClass", "", WS_CHILD, 15, 110, 1135, 540, parent, NULL, NULL, NULL);
 
-    HWND btn_gen = CreateWindow("BUTTON", "Generate Ordered Report (In-Order BST)", WS_CHILD | WS_VISIBLE | BS_FLAT, 0, 0, 290, 32, g_app.hwnd_panel_reports, (HMENU)ID_BTN_GEN_REPORT, NULL, NULL);
+    HWND btn_gen = CreateWindow("BUTTON", "Generate Ordered Report (In-Order BST)", WS_CHILD | WS_VISIBLE | BS_FLAT, 0, 0, 290, 32, g_app.hwnd_panel_reports, (HMENU)2006, NULL, NULL);
     SendMessage(btn_gen, WM_SETFONT, (WPARAM)g_app.font_bold, TRUE);
     apply_unified_theme(btn_gen, g_app.font_bold);
 
@@ -1377,14 +1500,15 @@ static void build_reports_page(HWND parent) {
     create_listview_columns(g_app.hwnd_lv_report, cols, 8);
 }
 
-
-
-
 static void generate_report(void) {
     ListView_DeleteAllItems(g_app.hwnd_lv_report);
 
-    ReportCtx ctx = { g_app.hwnd_lv_report };
-    bst_inorder(g_app.bst_root, collect_report_row, &ctx);
+    const BSTNode *nodes[30];
+    int node_count = 0;
+    bst_inorder(g_app.bst_root, nodes, &node_count);
+    for (int i = 0; i < node_count; i++) {
+        collect_report_row(nodes[i], g_app.hwnd_lv_report);
+    }
 
     char stats[192];
     snprintf(stats, sizeof(stats), "In-Order BST Traversal Execution Complete | Active Zones: %d | Tree Depth: %d | Rows Shown: %d",
@@ -1393,18 +1517,27 @@ static void generate_report(void) {
 }
 
 static void show_tab_panel(int index) {
-    ShowWindow(g_app.hwnd_panel_dash, index == 0 ? SW_SHOW : SW_HIDE);
-    ShowWindow(g_app.hwnd_panel_alerts, index == 1 ? SW_SHOW : SW_HIDE);
-    ShowWindow(g_app.hwnd_panel_archive, index == 2 ? SW_SHOW : SW_HIDE);
-    ShowWindow(g_app.hwnd_panel_reports, index == 3 ? SW_SHOW : SW_HIDE);
+    if (index == 0) {
+        ShowWindow(g_app.hwnd_panel_dash, SW_SHOW);
+    } else {
+        ShowWindow(g_app.hwnd_panel_dash, SW_HIDE);
+    }
+    if (index == 1) {
+        ShowWindow(g_app.hwnd_panel_alerts, SW_SHOW);
+    } else {
+        ShowWindow(g_app.hwnd_panel_alerts, SW_HIDE);
+    }
+    if (index == 2) {
+        ShowWindow(g_app.hwnd_panel_archive, SW_SHOW);
+    } else {
+        ShowWindow(g_app.hwnd_panel_archive, SW_HIDE);
+    }
+    if (index == 3) {
+        ShowWindow(g_app.hwnd_panel_reports, SW_SHOW);
+    } else {
+        ShowWindow(g_app.hwnd_panel_reports, SW_HIDE);
+    }
 }
-
-
-
-
-
-
-
 
 static void resize_dashboard_children(int panel_w, int panel_h) {
     if (!g_app.hwnd_sparkline) return;
@@ -1432,7 +1565,7 @@ static void resize_archive_children(int panel_w, int panel_h) {
     int content_h = panel_h - CONTENT_TOP - 5;
     if (content_h < 100) content_h = 100;
 
-    MoveWindow(g_app.hwnd_lbl_bst_step, 0, 48, left_w, 24, TRUE);
+    MoveWindow(g_app.hwnd_lbl_bst_step, 182, 48, left_w - 182, 24, TRUE);
     MoveWindow(g_app.hwnd_bst_tree, 0, CONTENT_TOP, left_w, content_h, TRUE);
     MoveWindow(g_app.hwnd_lbl_search_details, right_x, 48, right_w, 24, TRUE);
     MoveWindow(g_app.hwnd_edit_search_info, right_x, CONTENT_TOP, right_w, content_h, TRUE);
@@ -1477,16 +1610,7 @@ static void layout_ui(int client_w, int client_h) {
     resize_reports_children(panel_w, panel_h);
 }
 
-
-
-
 static void enable_dpi_awareness(void) {
-    HMODULE hUser32 = GetModuleHandleA("user32.dll");
-    if (hUser32) {
-        typedef BOOL(WINAPI * SetDpiCtxFn)(HANDLE);
-        SetDpiCtxFn pSetCtx = (SetDpiCtxFn)GetProcAddress(hUser32, "SetProcessDpiAwarenessContext");
-        if (pSetCtx && pSetCtx((HANDLE)(-4))) return; 
-    }
     SetProcessDPIAware();
 }
 
@@ -1499,21 +1623,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_app.font_bold = CreateFont(15, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
             g_app.font_kpi_digit = CreateFont(26, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
 
-            g_app.brush_bg = CreateSolidBrush(COLOR_BG);
-            g_app.brush_card = CreateSolidBrush(COLOR_CARD_BG);
-            g_app.brush_header = CreateSolidBrush(COLOR_HEADER_BG);
+            g_app.brush_bg = CreateSolidBrush(RGB(248, 250, 252));
+            g_app.brush_card = CreateSolidBrush(RGB(255, 255, 255));
+            g_app.brush_header = CreateSolidBrush(RGB(15, 23, 42));
 
             g_app.hwnd_header = CreateWindow("HeaderClass", "", WS_CHILD | WS_VISIBLE, 0, 0, 1180, 50, hwnd, NULL, NULL, NULL);
 
-            g_app.hwnd_btn_start = CreateWindow("BUTTON", "Start Live Feed", WS_CHILD | WS_VISIBLE | BS_FLAT, 15, 60, 130, 32, hwnd, (HMENU)ID_BTN_START, NULL, NULL);
+            g_app.hwnd_btn_start = CreateWindow("BUTTON", "Start Live Feed", WS_CHILD | WS_VISIBLE | BS_FLAT, 15, 60, 130, 32, hwnd, (HMENU)2002, NULL, NULL);
             SendMessage(g_app.hwnd_btn_start, WM_SETFONT, (WPARAM)g_app.font_bold, TRUE);
             apply_unified_theme(g_app.hwnd_btn_start, g_app.font_bold);
 
-            g_app.hwnd_btn_stop = CreateWindow("BUTTON", "Pause Feed", WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_FLAT, 155, 60, 120, 32, hwnd, (HMENU)ID_BTN_STOP, NULL, NULL);
+            g_app.hwnd_btn_stop = CreateWindow("BUTTON", "Pause Feed", WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_FLAT, 155, 60, 120, 32, hwnd, (HMENU)2003, NULL, NULL);
             SendMessage(g_app.hwnd_btn_stop, WM_SETFONT, (WPARAM)g_app.font_bold, TRUE);
             apply_unified_theme(g_app.hwnd_btn_stop, g_app.font_bold);
 
-            g_app.hwnd_tab = CreateWindow(WC_TABCONTROL, "", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 290, 60, 860, 36, hwnd, (HMENU)ID_TAB_CONTROL, NULL, NULL);
+            g_app.hwnd_tab = CreateWindow(WC_TABCONTROL, "", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 290, 60, 860, 36, hwnd, (HMENU)2001, NULL, NULL);
             SendMessage(g_app.hwnd_tab, WM_SETFONT, (WPARAM)g_app.font_bold, TRUE);
             apply_unified_theme(g_app.hwnd_tab, g_app.font_bold);
             TabCtrl_SetCurSel(g_app.hwnd_tab, 0);
@@ -1559,30 +1683,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             COLORREF accent = (COLORREF)GetWindowLongPtr((HWND)lParam, GWLP_USERDATA);
             if (msg == WM_CTLCOLOREDIT) {
                 SetBkMode(hdcStatic, OPAQUE);
-                SetBkColor(hdcStatic, COLOR_CARD_BG);
+                SetBkColor(hdcStatic, RGB(255, 255, 255));
             } else {
                 SetBkMode(hdcStatic, TRANSPARENT);
             }
-            SetTextColor(hdcStatic, accent ? accent : COLOR_TEXT_DARK);
+            if (accent) {
+                SetTextColor(hdcStatic, accent);
+            } else {
+                SetTextColor(hdcStatic, RGB(15, 23, 42));
+            }
             return (LRESULT)g_app.brush_card;
         }
 
         case WM_COMMAND: {
             switch (LOWORD(wParam)) {
-                case ID_BTN_START:
+                case 2002:
                     if (!g_app.running) {
                         g_app.running = TRUE;
-                        SetTimer(hwnd, TIMER_STREAM_ID, g_app.interval_ms, NULL);
+                        SetTimer(hwnd, 1001, g_app.interval_ms, NULL);
                         EnableWindow(g_app.hwnd_btn_start, FALSE);
                         EnableWindow(g_app.hwnd_btn_stop, TRUE);
                         update_kpi_labels(&g_app);
                     }
                     break;
 
-                case ID_BTN_STOP:
+                case 2003:
                     if (g_app.running) {
                         g_app.running = FALSE;
-                        KillTimer(hwnd, TIMER_STREAM_ID);
+                        KillTimer(hwnd, 1001);
                         EnableWindow(g_app.hwnd_btn_start, TRUE);
                         EnableWindow(g_app.hwnd_btn_stop, FALSE);
                         update_kpi_labels(&g_app);
@@ -1590,7 +1718,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     break;
 
                 
-                case ID_BTN_EXTRACT:
+                case 2004:
                     if (!heap_is_empty(&g_app.heap)) {
                         
                         AlertNode top_alert = heap_extract_max(&g_app.heap);
@@ -1625,10 +1753,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     }
                     break;
 
-                case ID_BTN_SEARCH: {
+                case 2005: {
                     int sel = (int)SendMessage(g_app.hwnd_combo_search, CB_GETCURSEL, 0, 0);
                     if (sel == CB_ERR) {
-                        KillTimer(hwnd, TIMER_BST_SEARCH);
+                        KillTimer(hwnd, 1002);
                         g_app.bst_search_path_count = 0;
                         g_app.bst_search_step = 0;
                         g_app.bst_search_result = NULL;
@@ -1644,12 +1772,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     if (found) {
                         char info[512], time_buf[16];
                         format_time_label(found->timestamp, time_buf, sizeof(time_buf));
-                        double avg = found->reading_count > 0 ? (double)found->sum_aqi / (double)found->reading_count : 0.0;
+                        double avg = 0.0;
+                        if (found->reading_count > 0) {
+                            avg = (double)found->sum_aqi / (double)found->reading_count;
+                        }
 
                         snprintf(info, sizeof(info),
-                                 "LOCATION\n%s\nZone ID: %d\n\n"
-                                 "CURRENT AIR QUALITY\nAQI: %d (%s)\nPM2.5: %.1f ug/m3\n\n"
-                                 "HISTORY\nReadings: %ld\nAverage AQI: %.1f\nPeak AQI: %d\nLast updated: %s",
+                                 "LOCATION\r\n%s\r\nZone ID: %d\r\n\r\n"
+                                 "CURRENT AIR QUALITY\r\nAQI: %d (%s)\r\nPM2.5: %.1f ug/m3\r\n\r\n"
+                                 "HISTORY\r\nReadings: %ld\r\nAverage AQI: %.1f\r\nPeak AQI: %d\r\nLast updated: %s",
                                  sensor_region_name(found->region_id), found->region_id, found->aqi_val,
                                  sensor_aqi_category(found->aqi_val), found->pm25_val, found->reading_count,
                                  avg, found->peak_aqi, time_buf);
@@ -1662,7 +1793,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     break;
                 }
 
-                case ID_BTN_GEN_REPORT:
+                case 2006:
                     generate_report();
                     break;
 
@@ -1672,7 +1803,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_NOTIFY: {
             LPNMHDR nm = (LPNMHDR)lParam;
-            if (nm->idFrom == ID_TAB_CONTROL && nm->code == TCN_SELCHANGE) {
+            if (nm->idFrom == 2001 && nm->code == TCN_SELCHANGE) {
                 int cur = TabCtrl_GetCurSel(g_app.hwnd_tab);
                 show_tab_panel(cur);
             }
@@ -1688,12 +1819,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
                 if (pLVCD->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
                     char aqi_str[32] = {0};
-                    int aqi_col = pLVCD->nmcd.hdr.hwndFrom == g_app.hwnd_lv_report ||
-                                  pLVCD->nmcd.hdr.hwndFrom == g_app.hwnd_lv_alerts ? 2 : 3;
+                    int aqi_col = 3;
+                    if (pLVCD->nmcd.hdr.hwndFrom == g_app.hwnd_lv_report ||
+                        pLVCD->nmcd.hdr.hwndFrom == g_app.hwnd_lv_alerts) {
+                        aqi_col = 2;
+                    }
                     ListView_GetItemText(pLVCD->nmcd.hdr.hwndFrom, pLVCD->nmcd.dwItemSpec, aqi_col, aqi_str, sizeof(aqi_str));
                     int aqi = atoi(aqi_str);
 
-                    if (aqi > ALERT_THRESHOLD_AQI) {
+                    if (aqi > 300) {
                         pLVCD->clrTextBk = RGB(254, 226, 226);
                         pLVCD->clrText = RGB(159, 18, 57);
                     } else if (aqi > 100) {
@@ -1710,18 +1844,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case WM_TIMER: {
-            if (wParam == TIMER_STREAM_ID && g_app.running) {
+            if (wParam == 1001 && g_app.running) {
                 SensorReading reading;
                 sensor_generate_reading(&reading);
                 ingest_reading(&g_app, reading);
-            } else if (wParam == TIMER_BST_SEARCH) {
+            } else if (wParam == 1002) {
                 if (g_app.bst_search_step < g_app.bst_search_path_count) {
                     g_app.bst_search_step++;
                     update_bst_search_status();
                     InvalidateRect(g_app.hwnd_bst_tree, NULL, FALSE);
                 }
                 if (g_app.bst_search_step >= g_app.bst_search_path_count) {
-                    KillTimer(hwnd, TIMER_BST_SEARCH);
+                    KillTimer(hwnd, 1002);
                 }
             }
             break;
@@ -1733,6 +1867,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         }
 
+        case WM_MOUSEWHEEL:
+            if (mouse_pointer_over_bst_tree(lParam)) {
+                zoom_bst_with_wheel(wParam);
+                return 0;
+            }
+            break;
+
         case WM_GETMINMAXINFO: {
             MINMAXINFO *mmi = (MINMAXINFO *)lParam;
             mmi->ptMinTrackSize.x = 1170; 
@@ -1741,8 +1882,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case WM_DESTROY: {
-            KillTimer(hwnd, TIMER_STREAM_ID);
-            KillTimer(hwnd, TIMER_BST_SEARCH);
+            KillTimer(hwnd, 1001);
+            KillTimer(hwnd, 1002);
             bst_free(g_app.bst_root);
             heap_free(&g_app.heap);
 
@@ -1771,6 +1912,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    (void)hPrevInstance;
+    (void)lpCmdLine;
+    (void)nCmdShow;
+
     srand((unsigned int)time(NULL));
     enable_dpi_awareness();
 
@@ -1782,6 +1927,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     memset(&g_app, 0, sizeof(AppState));
     heap_init(&g_app.heap);
     g_app.interval_ms = 500;
+    g_app.bst_tree_zoom_percent = 100;
 
     WNDCLASS wcSpark = { 0 };
     wcSpark.lpfnWndProc = SparklineWndProc;
@@ -1793,14 +1939,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wcBSTTree.lpfnWndProc = BSTTreeWndProc;
     wcBSTTree.hInstance = hInstance;
     wcBSTTree.lpszClassName = "BSTTreeClass";
-    wcBSTTree.hbrBackground = CreateSolidBrush(COLOR_CARD_BG);
+    wcBSTTree.hbrBackground = CreateSolidBrush(RGB(255, 255, 255));
     RegisterClass(&wcBSTTree);
 
     WNDCLASS wcPanel = { 0 };
     wcPanel.lpfnWndProc = AQIPanelWndProc;
     wcPanel.hInstance = hInstance;
     wcPanel.lpszClassName = "AQIPanelClass";
-    wcPanel.hbrBackground = CreateSolidBrush(COLOR_CARD_BG);
+    wcPanel.hbrBackground = CreateSolidBrush(RGB(255, 255, 255));
     RegisterClass(&wcPanel);
 
     WNDCLASS wcHeader = { 0 };
@@ -1818,7 +1964,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     WNDCLASS wc = { 0 };
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
-    wc.hbrBackground = CreateSolidBrush(COLOR_BG);
+    wc.hbrBackground = CreateSolidBrush(RGB(248, 250, 252));
     wc.lpszClassName = "AQIWin32EnterpriseEngine";
 
     RegisterClass(&wc);
