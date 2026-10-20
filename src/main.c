@@ -15,9 +15,9 @@
 #define RECENT_ROWS_LIMIT 200
 #define MAX_TOASTS 5
 #define ID_TOAST_TIMER 1
-#define FILTER_TEXT_MAX 64
 
 #define TIMER_STREAM_ID 1001
+#define TIMER_BST_SEARCH 1002
 
 #define ID_TAB_CONTROL         2001
 #define ID_BTN_START           2002
@@ -25,11 +25,7 @@
 #define ID_BTN_EXTRACT         2004
 #define ID_BTN_SEARCH          2005
 #define ID_BTN_GEN_REPORT      2006
-#define ID_BTN_EXP_REPORT      2007
 #define ID_COMBO_SEARCH        2008
-#define ID_BTN_ACK_SELECTED    2009
-#define ID_EDIT_FILTER_ALERTS  2010
-#define ID_EDIT_FILTER_REPORT  2011
 
 
 #define COLOR_BG            RGB(248, 250, 252)
@@ -47,15 +43,12 @@ typedef struct {
     int aqi;
     double pm25;
     long timestamp;
-    long id;            
-                         
 } AlertNode;
 
 typedef struct {
     AlertNode *tree;     
     int size;
     int capacity;
-    long next_id;
 } AlertHeap;
 
 typedef struct {
@@ -125,15 +118,22 @@ typedef struct {
     HWND hwnd_lv_recent;
 
     HWND hwnd_lv_alerts;
-    HWND hwnd_btn_ack_selected;
-    HWND hwnd_edit_filter_alerts;
 
     HWND hwnd_combo_search;
-    HWND hwnd_lbl_search_info;
+    HWND hwnd_lbl_search_details;
+    HWND hwnd_edit_search_info;
+    HWND hwnd_bst_tree;
+    HWND hwnd_lbl_bst_step;
+    const BSTNode *bst_search_path[REGION_COUNT];
+    int bst_search_path_count;
+    int bst_search_step;
+    int bst_search_target;
+    const BSTNode *bst_search_result;
+    int bst_tree_scroll_x;
+    int bst_tree_scroll_y;
 
     HWND hwnd_lv_report;
     HWND hwnd_lbl_report_stats;
-    HWND hwnd_edit_filter_report;
 
     HWND hwnd_btn_start;
     HWND hwnd_btn_stop;
@@ -164,7 +164,6 @@ void heap_init(AlertHeap *heap) {
     heap->capacity = INITIAL_HEAP_CAPACITY;
     heap->tree = (AlertNode *)calloc((size_t)heap->capacity, sizeof(AlertNode));
     heap->size = 0;
-    heap->next_id = 1;
 }
 
 void heap_free(AlertHeap *heap) {
@@ -213,26 +212,23 @@ static void max_heapify(AlertHeap *heap, int idx) {
 
 
 
-long heap_insert(AlertHeap *heap, int region_id, int aqi, double pm25, long timestamp) {
-    if (!heap_ensure_capacity(heap)) return -1;
+void heap_insert(AlertHeap *heap, int region_id, int aqi, double pm25, long timestamp) {
+    if (!heap_ensure_capacity(heap)) return;
 
     int i = heap->size;
     heap->tree[i].region_id = region_id;
     heap->tree[i].aqi = aqi;
     heap->tree[i].pm25 = pm25;
     heap->tree[i].timestamp = timestamp;
-    heap->tree[i].id = heap->next_id++;
-    long assigned_id = heap->tree[i].id;
     heap->size++;
 
     sift_up(heap, i);
-    return assigned_id;
 }
 
 
 AlertNode heap_extract_max(AlertHeap *heap) {
     if (heap_is_empty(heap)) {
-        AlertNode empty_node = { -1, -1, 0.0, 0, -1 };
+        AlertNode empty_node = { -1, -1, 0.0, 0 };
         return empty_node;
     }
     AlertNode max_alert = heap->tree[0];
@@ -245,23 +241,6 @@ AlertNode heap_extract_max(AlertHeap *heap) {
 
 
 
-
-AlertNode heap_extract_by_id(AlertHeap *heap, long id) {
-    for (int i = 0; i < heap->size; i++) {
-        if (heap->tree[i].id == id) {
-            AlertNode removed = heap->tree[i];
-            heap->tree[i] = heap->tree[heap->size - 1];
-            heap->size--;
-            if (i < heap->size) {
-                max_heapify(heap, i);
-                sift_up(heap, i);
-            }
-            return removed;
-        }
-    }
-    AlertNode empty_node = { -1, -1, 0.0, 0, -1 };
-    return empty_node;
-}
 
 static BSTNode *create_node(int region_id, int aqi_val, double pm25_val, long timestamp) {
     BSTNode *node = (BSTNode *)malloc(sizeof(BSTNode));
@@ -298,10 +277,15 @@ BSTNode *bst_insert_or_update(BSTNode *root, int region_id, int aqi_val, double 
     return root;
 }
 
-BSTNode *bst_search(BSTNode *root, int target_region_id) {
-    if (root == NULL || root->region_id == target_region_id) return root;
-    if (target_region_id < root->region_id) return bst_search(root->left, target_region_id);
-    return bst_search(root->right, target_region_id);
+static BSTNode *bst_search_trace(BSTNode *root, int target_region_id,
+                                 const BSTNode **path, int *path_count) {
+    *path_count = 0;
+    while (root && *path_count < REGION_COUNT) {
+        path[(*path_count)++] = root;
+        if (root->region_id == target_region_id) return root;
+        root = target_region_id < root->region_id ? root->left : root->right;
+    }
+    return NULL;
 }
 
 void bst_inorder(const BSTNode *root, BSTVisitor visitor, void *user_data) {
@@ -425,19 +409,6 @@ static void add_listview_row(HWND hwnd_lv, const char* col0, const char* col1, c
 }
 
 
-static BOOL ci_strstr(const char *haystack, const char *needle) {
-    if (!needle || !*needle) return TRUE;
-    size_t hn = strlen(haystack), nn = strlen(needle);
-    if (nn > hn) return FALSE;
-    for (size_t i = 0; i + nn <= hn; i++) {
-        size_t j = 0;
-        while (j < nn && tolower((unsigned char)haystack[i + j]) == tolower((unsigned char)needle[j])) j++;
-        if (j == nn) return TRUE;
-    }
-    return FALSE;
-}
-
-
 static int ci_strcmp(const char *a, const char *b) {
     while (*a && *b) {
         int ca = tolower((unsigned char)*a), cb = tolower((unsigned char)*b);
@@ -462,9 +433,6 @@ static void refresh_alerts_listview(AppState *s) {
     ListView_DeleteAllItems(s->hwnd_lv_alerts);
     if (heap_is_empty(&s->heap)) return;
 
-    char filter[FILTER_TEXT_MAX] = {0};
-    if (s->hwnd_edit_filter_alerts) GetWindowText(s->hwnd_edit_filter_alerts, filter, sizeof(filter));
-
     int n = s->heap.size;
     AlertNode *sorted = (AlertNode *)malloc((size_t)n * sizeof(AlertNode));
     if (!sorted) return;
@@ -474,7 +442,6 @@ static void refresh_alerts_listview(AppState *s) {
     int count = 0;
     for (int i = 0; i < n; i++) {
         const char *rname = sensor_region_name(sorted[i].region_id);
-        if (!ci_strstr(rname, filter)) continue;
 
         char time_buf[16], pm_buf[32], aqi_buf[32];
         format_time_label(sorted[i].timestamp, time_buf, sizeof(time_buf));
@@ -482,10 +449,9 @@ static void refresh_alerts_listview(AppState *s) {
         snprintf(aqi_buf, sizeof(aqi_buf), "%d", sorted[i].aqi);
 
         LVITEM lvi = { 0 };
-        lvi.mask = LVIF_TEXT | LVIF_PARAM;
+        lvi.mask = LVIF_TEXT;
         lvi.iItem = count;
         lvi.pszText = time_buf;
-        lvi.lParam = (LPARAM)sorted[i].id;
         int idx = ListView_InsertItem(s->hwnd_lv_alerts, &lvi);
 
         ListView_SetItemText(s->hwnd_lv_alerts, idx, 1, (LPSTR)rname);
@@ -581,6 +547,7 @@ static void ingest_reading(AppState *s, SensorReading reading) {
     }
 
     s->bst_root = bst_insert_or_update(s->bst_root, reading.region_id, reading.aqi, reading.pm25, reading.timestamp);
+    if (s->hwnd_bst_tree) InvalidateRect(s->hwnd_bst_tree, NULL, FALSE);
 
     if (!s->region_active[reading.region_id - 1]) {
         s->region_active[reading.region_id - 1] = TRUE;
@@ -913,7 +880,7 @@ static void apply_unified_theme(HWND hwnd, HFONT font) {
 static void style_listview_modern(HWND hwnd_lv) {
     if (!hwnd_lv) return;
     SetWindowTheme(hwnd_lv, L"Explorer", NULL);
-    DWORD ex_style = LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP;
+    DWORD ex_style = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP;
     ListView_SetExtendedListViewStyleEx(hwnd_lv, ex_style, ex_style);
     ListView_SetBkColor(hwnd_lv, COLOR_CARD_BG);
     ListView_SetTextBkColor(hwnd_lv, COLOR_CARD_BG);
@@ -939,15 +906,345 @@ static void create_listview_columns(HWND hwnd_lv, const char* cols[], int count)
     }
 }
 
+typedef struct {
+    const BSTNode *node;
+    int depth;
+    int x;
+    int y;
+} BSTLayoutEntry;
+
+static void collect_bst_layout(const BSTNode *node, int depth, BSTLayoutEntry entries[], int *count) {
+    if (!node || *count >= REGION_COUNT) return;
+    collect_bst_layout(node->left, depth + 1, entries, count);
+    if (*count < REGION_COUNT) {
+        entries[*count].node = node;
+        entries[*count].depth = depth;
+        (*count)++;
+    }
+    collect_bst_layout(node->right, depth + 1, entries, count);
+}
+
+static int find_bst_layout_entry(const BSTLayoutEntry entries[], int count, const BSTNode *node) {
+    for (int i = 0; i < count; i++) {
+        if (entries[i].node == node) return i;
+    }
+    return -1;
+}
+
+static int find_bst_search_step(const BSTNode *node) {
+    for (int i = 0; i < g_app.bst_search_path_count; i++) {
+        if (g_app.bst_search_path[i] == node) return i;
+    }
+    return -1;
+}
+
+static BOOL bst_search_edge_visited(const BSTNode *parent, const BSTNode *child) {
+    int last = g_app.bst_search_step;
+    if (last >= g_app.bst_search_path_count) last = g_app.bst_search_path_count - 1;
+    for (int i = 1; i <= last; i++) {
+        if (g_app.bst_search_path[i - 1] == parent && g_app.bst_search_path[i] == child) return TRUE;
+    }
+    return FALSE;
+}
+
+static void update_bst_scrollbars(HWND hwnd, const BSTLayoutEntry entries[], int count) {
+    RECT client;
+    GetClientRect(hwnd, &client);
+    int max_depth = 0;
+    for (int i = 0; i < count; i++) {
+        if (entries[i].depth > max_depth) max_depth = entries[i].depth;
+    }
+
+    int content_width = count > 0 ? 80 + (count - 1) * 88 : client.right;
+    if (content_width < client.right) content_width = client.right;
+    int content_height = count > 0 ? 76 + max_depth * 82 : client.bottom;
+    int page_height = client.bottom > 40 ? client.bottom - 40 : 1;
+    if (content_height < page_height) content_height = page_height;
+
+    SCROLLINFO si = { 0 };
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    si.nMin = 0;
+    si.nMax = content_width - 1;
+    si.nPage = (UINT)(client.right > 0 ? client.right : 1);
+    si.nPos = g_app.bst_tree_scroll_x;
+    SetScrollInfo(hwnd, SB_HORZ, &si, TRUE);
+    GetScrollInfo(hwnd, SB_HORZ, &si);
+    g_app.bst_tree_scroll_x = si.nPos;
+
+    si.nMax = content_height - 1;
+    si.nPage = (UINT)page_height;
+    si.nPos = g_app.bst_tree_scroll_y;
+    SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+    GetScrollInfo(hwnd, SB_VERT, &si);
+    g_app.bst_tree_scroll_y = si.nPos;
+}
+
+static void scroll_bst_tree(HWND hwnd, int bar, UINT request) {
+    SCROLLINFO si = { 0 };
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_ALL;
+    if (!GetScrollInfo(hwnd, bar, &si)) return;
+
+    int position = si.nPos;
+    int page = (int)si.nPage;
+    switch (request) {
+        case SB_LINELEFT:
+            position -= 44;
+            break;
+        case SB_LINERIGHT:
+            position += 44;
+            break;
+        case SB_PAGELEFT:
+            position -= page > 0 ? page : 44;
+            break;
+        case SB_PAGERIGHT:
+            position += page > 0 ? page : 44;
+            break;
+        case SB_THUMBPOSITION:
+        case SB_THUMBTRACK:
+            position = si.nTrackPos;
+            break;
+        case SB_TOP:
+            position = si.nMin;
+            break;
+        case SB_BOTTOM:
+            position = si.nMax;
+            break;
+        default:
+            return;
+    }
+
+    int max_position = si.nMax - (int)si.nPage + 1;
+    if (max_position < si.nMin) max_position = si.nMin;
+    if (position < si.nMin) position = si.nMin;
+    if (position > max_position) position = max_position;
+    if (position == si.nPos) return;
+
+    si.fMask = SIF_POS;
+    si.nPos = position;
+    SetScrollInfo(hwnd, bar, &si, TRUE);
+    if (bar == SB_HORZ) g_app.bst_tree_scroll_x = position;
+    else g_app.bst_tree_scroll_y = position;
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static void update_bst_search_status(void) {
+    char status[192];
+    if (g_app.bst_search_path_count == 0) {
+        snprintf(status, sizeof(status), "No active zones yet. Start the live feed to build the BST.");
+    } else if (g_app.bst_search_step < g_app.bst_search_path_count) {
+        const BSTNode *node = g_app.bst_search_path[g_app.bst_search_step];
+        if (node->region_id == g_app.bst_search_target) {
+            snprintf(status, sizeof(status), "Step %d/%d: target Zone %d matches this node.",
+                     g_app.bst_search_step + 1, g_app.bst_search_path_count, g_app.bst_search_target);
+        } else {
+            snprintf(status, sizeof(status), "Step %d/%d: target Zone %d is %s Zone %d; go %s.",
+                     g_app.bst_search_step + 1, g_app.bst_search_path_count,
+                     g_app.bst_search_target,
+                     g_app.bst_search_target < node->region_id ? "less than" : "greater than",
+                     node->region_id,
+                     g_app.bst_search_target < node->region_id ? "LEFT" : "RIGHT");
+        }
+    } else if (g_app.bst_search_result) {
+        snprintf(status, sizeof(status), "Search complete: Zone %d found in %d comparison%s.",
+                 g_app.bst_search_target, g_app.bst_search_path_count,
+                 g_app.bst_search_path_count == 1 ? "" : "s");
+    } else {
+        snprintf(status, sizeof(status), "Search complete: Zone %d was not found after %d comparison%s.",
+                 g_app.bst_search_target, g_app.bst_search_path_count,
+                 g_app.bst_search_path_count == 1 ? "" : "s");
+    }
+    SetWindowTextA(g_app.hwnd_lbl_bst_step, status);
+}
+
+static void set_archive_details(const char *text) {
+    SetWindowTextA(g_app.hwnd_edit_search_info, text);
+    SendMessage(g_app.hwnd_edit_search_info, EM_SETSEL, 0, 0);
+    SendMessage(g_app.hwnd_edit_search_info, EM_SCROLLCARET, 0, 0);
+}
+
+static void start_bst_search(int target_region_id) {
+    KillTimer(g_app.hwnd_main, TIMER_BST_SEARCH);
+    g_app.bst_search_target = target_region_id;
+    g_app.bst_search_result = NULL;
+    g_app.bst_search_step = 0;
+    g_app.bst_search_result = bst_search_trace(g_app.bst_root, target_region_id,
+                                                g_app.bst_search_path,
+                                                &g_app.bst_search_path_count);
+
+    update_bst_search_status();
+    InvalidateRect(g_app.hwnd_bst_tree, NULL, FALSE);
+    if (g_app.bst_search_path_count > 0 && !SetTimer(g_app.hwnd_main, TIMER_BST_SEARCH, 650, NULL)) {
+        SetWindowTextA(g_app.hwnd_lbl_bst_step, "Unable to animate the BST search because its timer could not be started.");
+        MessageBoxA(g_app.hwnd_main, "The BST search could not be animated because the timer could not be started.",
+                    "BST Animation Error", MB_OK | MB_ICONERROR);
+    }
+}
+
+static LRESULT CALLBACK BSTTreeWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_ERASEBKGND) return 1;
+    if (msg == WM_SIZE) {
+        BSTLayoutEntry entries[REGION_COUNT];
+        int count = 0;
+        collect_bst_layout(g_app.bst_root, 0, entries, &count);
+        update_bst_scrollbars(hwnd, entries, count);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+    if (msg == WM_HSCROLL) {
+        scroll_bst_tree(hwnd, SB_HORZ, LOWORD(wParam));
+        return 0;
+    }
+    if (msg == WM_VSCROLL) {
+        scroll_bst_tree(hwnd, SB_VERT, LOWORD(wParam));
+        return 0;
+    }
+    if (msg != WM_PAINT) return DefWindowProc(hwnd, msg, wParam, lParam);
+
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(hwnd, &ps);
+    RECT bounds;
+    GetClientRect(hwnd, &bounds);
+    FillRect(hdc, &bounds, g_app.brush_card);
+
+    HPEN border_pen = CreatePen(PS_SOLID, 1, COLOR_BORDER);
+    HGDIOBJ old_pen = SelectObject(hdc, border_pen);
+    HGDIOBJ old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    RoundRect(hdc, bounds.left, bounds.top, bounds.right, bounds.bottom, 12, 12);
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    DeleteObject(border_pen);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, COLOR_TEXT_MUTED);
+    SelectObject(hdc, g_app.font_sub);
+    const char *tree_title = "BINARY SEARCH TREE  |  REGION ID ORDER";
+    TextOutA(hdc, 16, 10, tree_title, (int)strlen(tree_title));
+
+    const COLORREF legend_colors[] = {
+        RGB(219, 234, 254), COLOR_PRIMARY, RGB(254, 243, 199), RGB(209, 250, 229)
+    };
+    const char *legend_labels[] = { "Node", "Visited", "Current", "Found" };
+    int legend_x = bounds.right - 335;
+    for (int i = 0; i < 4; i++) {
+        RECT swatch = { legend_x, 12, legend_x + 12, 24 };
+        HBRUSH swatch_brush = CreateSolidBrush(legend_colors[i]);
+        FillRect(hdc, &swatch, swatch_brush);
+        DeleteObject(swatch_brush);
+        SetTextColor(hdc, COLOR_TEXT_MUTED);
+        TextOutA(hdc, legend_x + 17, 10, legend_labels[i], (int)strlen(legend_labels[i]));
+        legend_x += i == 0 ? 64 : 78;
+    }
+
+    BSTLayoutEntry entries[REGION_COUNT];
+    int count = 0;
+    collect_bst_layout(g_app.bst_root, 0, entries, &count);
+    update_bst_scrollbars(hwnd, entries, count);
+    if (count == 0) {
+        SetTextColor(hdc, COLOR_TEXT_MUTED);
+        SelectObject(hdc, g_app.font_body);
+        const char *empty_text = "Start the live feed to populate the zone index.";
+        RECT text_rect = { 16, 45, bounds.right - 16, bounds.bottom - 12 };
+        DrawTextA(hdc, empty_text, -1, &text_rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    int max_depth = 0;
+    for (int i = 0; i < count; i++) {
+        if (entries[i].depth > max_depth) max_depth = entries[i].depth;
+    }
+    int content_width = count > 0 ? 80 + (count - 1) * 88 : bounds.right;
+    if (content_width < bounds.right) content_width = bounds.right;
+    int left_padding = (content_width - (count - 1) * 88 - 80) / 2 + 40;
+    for (int i = 0; i < count; i++) {
+        entries[i].x = left_padding + i * 88 - g_app.bst_tree_scroll_x;
+        entries[i].y = 48 + entries[i].depth * 82 - g_app.bst_tree_scroll_y;
+    }
+
+    RECT diagram_clip = { 0, 38, bounds.right, bounds.bottom };
+    IntersectClipRect(hdc, diagram_clip.left, diagram_clip.top, diagram_clip.right, diagram_clip.bottom);
+    HPEN edge_pen = CreatePen(PS_SOLID, 1, RGB(203, 213, 225));
+    old_pen = SelectObject(hdc, edge_pen);
+    for (int i = 0; i < count; i++) {
+        const BSTNode *children[] = { entries[i].node->left, entries[i].node->right };
+        for (int child_index = 0; child_index < 2; child_index++) {
+            if (!children[child_index]) continue;
+            int child_pos = find_bst_layout_entry(entries, count, children[child_index]);
+            if (child_pos < 0) continue;
+            if (bst_search_edge_visited(entries[i].node, children[child_index])) {
+                HPEN active_pen = CreatePen(PS_SOLID, 2, COLOR_PRIMARY);
+                SelectObject(hdc, active_pen);
+                MoveToEx(hdc, entries[i].x, entries[i].y, NULL);
+                LineTo(hdc, entries[child_pos].x, entries[child_pos].y);
+                SelectObject(hdc, edge_pen);
+                DeleteObject(active_pen);
+            } else {
+                MoveToEx(hdc, entries[i].x, entries[i].y, NULL);
+                LineTo(hdc, entries[child_pos].x, entries[child_pos].y);
+            }
+        }
+    }
+    SelectObject(hdc, old_pen);
+    DeleteObject(edge_pen);
+
+    for (int i = 0; i < count; i++) {
+        int path_step = find_bst_search_step(entries[i].node);
+        COLORREF fill = RGB(219, 234, 254);
+        COLORREF outline = COLOR_PRIMARY;
+        COLORREF text = COLOR_TEXT_DARK;
+        if (path_step >= 0 && path_step < g_app.bst_search_step) {
+            fill = COLOR_PRIMARY;
+            text = RGB(255, 255, 255);
+        }
+        if (path_step >= 0 && path_step == g_app.bst_search_step &&
+            g_app.bst_search_step < g_app.bst_search_path_count) {
+            fill = RGB(254, 243, 199);
+            outline = RGB(217, 119, 6);
+            text = RGB(146, 64, 14);
+        } else if (g_app.bst_search_result == entries[i].node &&
+                   g_app.bst_search_step >= g_app.bst_search_path_count) {
+            fill = RGB(209, 250, 229);
+            outline = COLOR_ACCENT_GREEN;
+            text = RGB(6, 78, 59);
+        }
+
+        HBRUSH node_brush = CreateSolidBrush(fill);
+        HPEN node_pen = CreatePen(PS_SOLID, 2, outline);
+        HGDIOBJ previous_brush = SelectObject(hdc, node_brush);
+        HGDIOBJ previous_pen = SelectObject(hdc, node_pen);
+        Ellipse(hdc, entries[i].x - 14, entries[i].y - 14, entries[i].x + 14, entries[i].y + 14);
+        SelectObject(hdc, previous_brush);
+        SelectObject(hdc, previous_pen);
+        DeleteObject(node_brush);
+        DeleteObject(node_pen);
+
+        char node_label[8];
+        snprintf(node_label, sizeof(node_label), "%d", entries[i].node->region_id);
+        SIZE label_size;
+        GetTextExtentPoint32A(hdc, node_label, (int)strlen(node_label), &label_size);
+        SetTextColor(hdc, text);
+        SelectObject(hdc, g_app.font_bold);
+        TextOutA(hdc, entries[i].x - label_size.cx / 2, entries[i].y - label_size.cy / 2,
+                 node_label, (int)strlen(node_label));
+    }
+
+    EndPaint(hwnd, &ps);
+    return 0;
+}
+
 static HWND create_kpi_card(HWND parent, int x, int y, int w, int h, const char* title, HWND *out_val_hwnd, COLORREF accent_col) {
     HWND panel = CreateWindow("AQIPanelClass", "", WS_CHILD | WS_VISIBLE, x, y, w, h, parent, NULL, NULL, NULL);
 
     HWND lbl_title = CreateWindow("STATIC", title, WS_CHILD | WS_VISIBLE, 15, 12, w - 30, 18, panel, NULL, NULL, NULL);
     SendMessage(lbl_title, WM_SETFONT, (WPARAM)g_app.font_sub, TRUE);
+    SetWindowLongPtr(lbl_title, GWLP_USERDATA, (LONG_PTR)COLOR_TEXT_MUTED);
     apply_unified_theme(lbl_title, g_app.font_sub);
 
     *out_val_hwnd = CreateWindow("STATIC", "0", WS_CHILD | WS_VISIBLE, 15, 32, w - 30, 32, panel, NULL, NULL, NULL);
     SendMessage(*out_val_hwnd, WM_SETFONT, (WPARAM)g_app.font_kpi_digit, TRUE);
+    SetWindowLongPtr(*out_val_hwnd, GWLP_USERDATA, (LONG_PTR)accent_col);
     apply_unified_theme(*out_val_hwnd, g_app.font_kpi_digit);
     apply_unified_theme(panel, g_app.font_sub);
 
@@ -986,18 +1283,6 @@ static void build_alerts_page(HWND parent) {
     SendMessage(btn_ext, WM_SETFONT, (WPARAM)g_app.font_bold, TRUE);
     apply_unified_theme(btn_ext, g_app.font_bold);
 
-    g_app.hwnd_btn_ack_selected = CreateWindow("BUTTON", "Acknowledge Selected Row", WS_CHILD | WS_VISIBLE | BS_FLAT, 270, 0, 190, 32, g_app.hwnd_panel_alerts, (HMENU)ID_BTN_ACK_SELECTED, NULL, NULL);
-    SendMessage(g_app.hwnd_btn_ack_selected, WM_SETFONT, (WPARAM)g_app.font_bold, TRUE);
-    apply_unified_theme(g_app.hwnd_btn_ack_selected, g_app.font_bold);
-
-    HWND lbl_filter = CreateWindow("STATIC", "Filter:", WS_CHILD | WS_VISIBLE, 475, 6, 45, 20, g_app.hwnd_panel_alerts, NULL, NULL, NULL);
-    SendMessage(lbl_filter, WM_SETFONT, (WPARAM)g_app.font_body, TRUE);
-    apply_unified_theme(lbl_filter, g_app.font_body);
-
-    g_app.hwnd_edit_filter_alerts = CreateWindow("EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 520, 3, 220, 26, g_app.hwnd_panel_alerts, (HMENU)ID_EDIT_FILTER_ALERTS, NULL, NULL);
-    SendMessage(g_app.hwnd_edit_filter_alerts, WM_SETFONT, (WPARAM)g_app.font_body, TRUE);
-    apply_unified_theme(g_app.hwnd_edit_filter_alerts, g_app.font_body);
-
     g_app.hwnd_lv_alerts = CreateWindow(WC_LISTVIEW, "", WS_CHILD | WS_VISIBLE | LVS_REPORT | WS_BORDER, 0, 45, 1125, 485, g_app.hwnd_panel_alerts, NULL, NULL, NULL);
     SendMessage(g_app.hwnd_lv_alerts, WM_SETFONT, (WPARAM)g_app.font_body, TRUE);
     style_listview_modern(g_app.hwnd_lv_alerts);
@@ -1011,29 +1296,42 @@ static void build_archive_page(HWND parent) {
 
     HWND lbl_sel = CreateWindow("STATIC", "Select Mumbai Zone:", WS_CHILD | WS_VISIBLE, 0, 12, 140, 22, g_app.hwnd_panel_archive, NULL, NULL, NULL);
     SendMessage(lbl_sel, WM_SETFONT, (WPARAM)g_app.font_bold, TRUE);
+    apply_unified_theme(lbl_sel, g_app.font_bold);
 
     g_app.hwnd_combo_search = CreateWindow("COMBOBOX", "", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 145, 8, 300, 300, g_app.hwnd_panel_archive, (HMENU)ID_COMBO_SEARCH, NULL, NULL);
     SendMessage(g_app.hwnd_combo_search, WM_SETFONT, (WPARAM)g_app.font_body, TRUE);
+    apply_unified_theme(g_app.hwnd_combo_search, g_app.font_body);
 
     HWND btn_sch = CreateWindow("BUTTON", "Search Index (BST)", WS_CHILD | WS_VISIBLE | BS_FLAT, 455, 7, 160, 30, g_app.hwnd_panel_archive, (HMENU)ID_BTN_SEARCH, NULL, NULL);
     SendMessage(btn_sch, WM_SETFONT, (WPARAM)g_app.font_bold, TRUE);
     apply_unified_theme(btn_sch, g_app.font_bold);
 
-    g_app.hwnd_lbl_search_info = CreateWindow("STATIC", "Select an active Mumbai region from the dropdown menu to query current metrics from the Binary Search Tree.", WS_CHILD | WS_VISIBLE, 0, 55, 1125, 470, g_app.hwnd_panel_archive, NULL, NULL, NULL);
-    SendMessage(g_app.hwnd_lbl_search_info, WM_SETFONT, (WPARAM)g_app.font_body, TRUE);
-    apply_unified_theme(g_app.hwnd_lbl_search_info, g_app.font_body);
+    g_app.hwnd_lbl_bst_step = CreateWindow("STATIC", "Select a zone and search to watch the BST compare nodes.", WS_CHILD | WS_VISIBLE, 635, 12, 480, 22, g_app.hwnd_panel_archive, NULL, NULL, NULL);
+    SendMessage(g_app.hwnd_lbl_bst_step, WM_SETFONT, (WPARAM)g_app.font_sub, TRUE);
+    apply_unified_theme(g_app.hwnd_lbl_bst_step, g_app.font_sub);
+
+    g_app.hwnd_lbl_search_details = CreateWindow("STATIC", "SELECTED LOCATION DETAILS", WS_CHILD | WS_VISIBLE, 800, 50, 320, 20, g_app.hwnd_panel_archive, NULL, NULL, NULL);
+    SendMessage(g_app.hwnd_lbl_search_details, WM_SETFONT, (WPARAM)g_app.font_bold, TRUE);
+    apply_unified_theme(g_app.hwnd_lbl_search_details, g_app.font_bold);
+
+    g_app.hwnd_bst_tree = CreateWindow("BSTTreeClass", "", WS_CHILD | WS_VISIBLE | WS_HSCROLL | WS_VSCROLL | WS_BORDER, 0, 76, 780, 450, g_app.hwnd_panel_archive, NULL, NULL, NULL);
+
+    g_app.hwnd_edit_search_info = CreateWindow("EDIT", "Select an active Mumbai region from the dropdown menu to view its current and historical metrics.",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+        800, 76, 320, 450, g_app.hwnd_panel_archive, NULL, NULL, NULL);
+    SendMessage(g_app.hwnd_edit_search_info, WM_SETFONT, (WPARAM)g_app.font_body, TRUE);
+    SendMessage(g_app.hwnd_edit_search_info, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(10, 8));
+    apply_unified_theme(g_app.hwnd_edit_search_info, g_app.font_body);
 }
 
 typedef struct {
     HWND lv;
-    const char *filter;
 } ReportCtx;
 
 static void collect_report_row(const BSTNode *node, void *user_data) {
     ReportCtx *ctx = (ReportCtx *)user_data;
     HWND lv = ctx->lv;
     const char *rname = sensor_region_name(node->region_id);
-    if (!ci_strstr(rname, ctx->filter)) return;
 
     char r_id[16], c_aqi[16], avg_aqi[32], peak[16], count[32], time_buf[16];
     format_time_label(node->timestamp, time_buf, sizeof(time_buf));
@@ -1067,21 +1365,9 @@ static void build_reports_page(HWND parent) {
     SendMessage(btn_gen, WM_SETFONT, (WPARAM)g_app.font_bold, TRUE);
     apply_unified_theme(btn_gen, g_app.font_bold);
 
-    HWND btn_exp = CreateWindow("BUTTON", "Export CSV Summary", WS_CHILD | WS_VISIBLE | BS_FLAT, 305, 0, 170, 32, g_app.hwnd_panel_reports, (HMENU)ID_BTN_EXP_REPORT, NULL, NULL);
-    SendMessage(btn_exp, WM_SETFONT, (WPARAM)g_app.font_bold, TRUE);
-    apply_unified_theme(btn_exp, g_app.font_bold);
-
-    g_app.hwnd_lbl_report_stats = CreateWindow("STATIC", "Click 'Generate Ordered Report' to execute tree traversal.", WS_CHILD | WS_VISIBLE, 490, 8, 380, 20, g_app.hwnd_panel_reports, NULL, NULL, NULL);
+    g_app.hwnd_lbl_report_stats = CreateWindow("STATIC", "Generate a report to view all active zones.", WS_CHILD | WS_VISIBLE, 310, 8, 790, 20, g_app.hwnd_panel_reports, NULL, NULL, NULL);
     SendMessage(g_app.hwnd_lbl_report_stats, WM_SETFONT, (WPARAM)g_app.font_body, TRUE);
     apply_unified_theme(g_app.hwnd_lbl_report_stats, g_app.font_body);
-
-    HWND lbl_filter = CreateWindow("STATIC", "Filter:", WS_CHILD | WS_VISIBLE, 875, 6, 45, 20, g_app.hwnd_panel_reports, NULL, NULL, NULL);
-    SendMessage(lbl_filter, WM_SETFONT, (WPARAM)g_app.font_body, TRUE);
-    apply_unified_theme(lbl_filter, g_app.font_body);
-
-    g_app.hwnd_edit_filter_report = CreateWindow("EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 920, 3, 200, 26, g_app.hwnd_panel_reports, (HMENU)ID_EDIT_FILTER_REPORT, NULL, NULL);
-    SendMessage(g_app.hwnd_edit_filter_report, WM_SETFONT, (WPARAM)g_app.font_body, TRUE);
-    apply_unified_theme(g_app.hwnd_edit_filter_report, g_app.font_body);
 
     g_app.hwnd_lv_report = CreateWindow(WC_LISTVIEW, "", WS_CHILD | WS_VISIBLE | LVS_REPORT | WS_BORDER, 0, 45, 1125, 485, g_app.hwnd_panel_reports, NULL, NULL, NULL);
     SendMessage(g_app.hwnd_lv_report, WM_SETFONT, (WPARAM)g_app.font_body, TRUE);
@@ -1097,10 +1383,7 @@ static void build_reports_page(HWND parent) {
 static void generate_report(void) {
     ListView_DeleteAllItems(g_app.hwnd_lv_report);
 
-    char filter[FILTER_TEXT_MAX] = {0};
-    if (g_app.hwnd_edit_filter_report) GetWindowText(g_app.hwnd_edit_filter_report, filter, sizeof(filter));
-
-    ReportCtx ctx = { g_app.hwnd_lv_report, filter };
+    ReportCtx ctx = { g_app.hwnd_lv_report };
     bst_inorder(g_app.bst_root, collect_report_row, &ctx);
 
     char stats[192];
@@ -1140,10 +1423,19 @@ static void resize_alerts_children(int panel_w, int panel_h) {
 }
 
 static void resize_archive_children(int panel_w, int panel_h) {
-    if (!g_app.hwnd_lbl_search_info) return;
-    int lbl_h = panel_h - 55 - 5;
-    if (lbl_h < 80) lbl_h = 80;
-    MoveWindow(g_app.hwnd_lbl_search_info, 0, 55, panel_w, lbl_h, TRUE);
+    if (!g_app.hwnd_bst_tree || !g_app.hwnd_edit_search_info) return;
+    const int COLUMN_GAP = 14;
+    const int CONTENT_TOP = 76;
+    int left_w = (panel_w - COLUMN_GAP) * 7 / 10;
+    int right_x = left_w + COLUMN_GAP;
+    int right_w = panel_w - right_x;
+    int content_h = panel_h - CONTENT_TOP - 5;
+    if (content_h < 100) content_h = 100;
+
+    MoveWindow(g_app.hwnd_lbl_bst_step, 0, 48, left_w, 24, TRUE);
+    MoveWindow(g_app.hwnd_bst_tree, 0, CONTENT_TOP, left_w, content_h, TRUE);
+    MoveWindow(g_app.hwnd_lbl_search_details, right_x, 48, right_w, 24, TRUE);
+    MoveWindow(g_app.hwnd_edit_search_info, right_x, CONTENT_TOP, right_w, content_h, TRUE);
 }
 
 static void resize_reports_children(int panel_w, int panel_h) {
@@ -1196,31 +1488,6 @@ static void enable_dpi_awareness(void) {
         if (pSetCtx && pSetCtx((HANDLE)(-4))) return; 
     }
     SetProcessDPIAware();
-}
-
-static void export_csv_report(void) {
-    FILE *f = fopen("mumbai_aqi_report.csv", "w");
-    if (!f) {
-        MessageBox(g_app.hwnd_main, "Failed to write CSV file.", "Export Error", MB_ICONERROR);
-        return;
-    }
-    fprintf(f, "ZoneID,ZoneName,CurrentAQI,Category,AverageAQI,PeakAQI,ReadingCount\n");
-
-    int count = ListView_GetItemCount(g_app.hwnd_lv_report);
-    for (int i = 0; i < count; i++) {
-        char r_id[32], r_name[64], aqi[32], cat[32], avg[32], peak[32], read_cnt[32];
-        ListView_GetItemText(g_app.hwnd_lv_report, i, 0, r_id, sizeof(r_id));
-        ListView_GetItemText(g_app.hwnd_lv_report, i, 1, r_name, sizeof(r_name));
-        ListView_GetItemText(g_app.hwnd_lv_report, i, 2, aqi, sizeof(aqi));
-        ListView_GetItemText(g_app.hwnd_lv_report, i, 3, cat, sizeof(cat));
-        ListView_GetItemText(g_app.hwnd_lv_report, i, 4, avg, sizeof(avg));
-        ListView_GetItemText(g_app.hwnd_lv_report, i, 5, peak, sizeof(peak));
-        ListView_GetItemText(g_app.hwnd_lv_report, i, 6, read_cnt, sizeof(read_cnt));
-
-        fprintf(f, "%s,%s,%s,%s,%s,%s,%s\n", r_id, r_name, aqi, cat, avg, peak, read_cnt);
-    }
-    fclose(f);
-    MessageBox(g_app.hwnd_main, "Report successfully exported to 'mumbai_aqi_report.csv'", "Export Complete", MB_ICONINFORMATION);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1289,8 +1556,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_CTLCOLORBTN:
         case WM_CTLCOLORLISTBOX: {
             HDC hdcStatic = (HDC)wParam;
-            SetBkMode(hdcStatic, TRANSPARENT);
-            SetTextColor(hdcStatic, COLOR_TEXT_DARK);
+            COLORREF accent = (COLORREF)GetWindowLongPtr((HWND)lParam, GWLP_USERDATA);
+            if (msg == WM_CTLCOLOREDIT) {
+                SetBkMode(hdcStatic, OPAQUE);
+                SetBkColor(hdcStatic, COLOR_CARD_BG);
+            } else {
+                SetBkMode(hdcStatic, TRANSPARENT);
+            }
+            SetTextColor(hdcStatic, accent ? accent : COLOR_TEXT_DARK);
             return (LRESULT)g_app.brush_card;
         }
 
@@ -1355,11 +1628,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 case ID_BTN_SEARCH: {
                     int sel = (int)SendMessage(g_app.hwnd_combo_search, CB_GETCURSEL, 0, 0);
                     if (sel == CB_ERR) {
-                        SetWindowText(g_app.hwnd_lbl_search_info, "No telemetry records ingested yet.");
+                        KillTimer(hwnd, TIMER_BST_SEARCH);
+                        g_app.bst_search_path_count = 0;
+                        g_app.bst_search_step = 0;
+                        g_app.bst_search_result = NULL;
+                        update_bst_search_status();
+                        InvalidateRect(g_app.hwnd_bst_tree, NULL, FALSE);
+                        set_archive_details("No telemetry records ingested yet.");
                         break;
                     }
                     int rid = (int)SendMessage(g_app.hwnd_combo_search, CB_GETITEMDATA, sel, 0);
-                    BSTNode *found = bst_search(g_app.bst_root, rid);
+                    start_bst_search(rid);
+                    const BSTNode *found = g_app.bst_search_result;
 
                     if (found) {
                         char info[512], time_buf[16];
@@ -1367,22 +1647,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         double avg = found->reading_count > 0 ? (double)found->sum_aqi / (double)found->reading_count : 0.0;
 
                         snprintf(info, sizeof(info),
-                                 "MUMBAI REGION SUMMARY\n"
-                                 "-------------------------------------------\n"
-                                 "Location Name:          %s\n"
-                                 "Region ID:               %d\n\n"
-                                 "CURRENT METRICS\n"
-                                 "Current AQI Level:      %d (%s)\n"
-                                 "PM2.5 Density:           %.1f ug/m3\n\n"
-                                 "HISTORICAL METRICS (BST)\n"
-                                 "Total Readings:          %ld\n"
-                                 "Average Observed AQI:    %.1f\n"
-                                 "Peak Recorded AQI:       %d\n"
-                                 "Last Updated Time:       %s",
+                                 "LOCATION\n%s\nZone ID: %d\n\n"
+                                 "CURRENT AIR QUALITY\nAQI: %d (%s)\nPM2.5: %.1f ug/m3\n\n"
+                                 "HISTORY\nReadings: %ld\nAverage AQI: %.1f\nPeak AQI: %d\nLast updated: %s",
                                  sensor_region_name(found->region_id), found->region_id, found->aqi_val,
                                  sensor_aqi_category(found->aqi_val), found->pm25_val, found->reading_count,
                                  avg, found->peak_aqi, time_buf);
-                        SetWindowText(g_app.hwnd_lbl_search_info, info);
+                        set_archive_details(info);
+                    } else {
+                        char info[192];
+                        snprintf(info, sizeof(info), "Zone %d is not present in the current BST.", rid);
+                        set_archive_details(info);
                     }
                     break;
                 }
@@ -1391,55 +1666,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     generate_report();
                     break;
 
-                case ID_BTN_EXP_REPORT:
-                    export_csv_report();
-                    break;
-
-                
-                
-                
-                case ID_BTN_ACK_SELECTED: {
-                    int sel = ListView_GetNextItem(g_app.hwnd_lv_alerts, -1, LVNI_SELECTED);
-                    if (sel == -1) {
-                        MessageBox(hwnd, "Select a row in the Emergency Queue list first.",
-                                   "No Row Selected", MB_OK | MB_ICONEXCLAMATION);
-                        break;
-                    }
-
-                    LVITEM lvi = { 0 };
-                    lvi.mask = LVIF_PARAM;
-                    lvi.iItem = sel;
-                    ListView_GetItem(g_app.hwnd_lv_alerts, &lvi);
-
-                    AlertNode removed = heap_extract_by_id(&g_app.heap, (long)lvi.lParam);
-                    if (removed.id != -1) {
-                        char ack_msg[384], time_buf[16];
-                        format_time_label(removed.timestamp, time_buf, sizeof(time_buf));
-                        snprintf(ack_msg, sizeof(ack_msg),
-                                 "SELECTED ALERT ACKNOWLEDGED & DISPATCHED\n"
-                                 "--------------------------------------------------\n"
-                                 "Zone Location:  %s (ID: %d)\n"
-                                 "AQI:            %d (%s)\n"
-                                 "PM2.5 Density:  %.1f ug/m3\n"
-                                 "Ingest Time:    %s\n\n"
-                                 "The item was removed from priority queue.",
-                                 sensor_region_name(removed.region_id), removed.region_id,
-                                 removed.aqi, sensor_aqi_category(removed.aqi), removed.pm25, time_buf);
-                        MessageBox(hwnd, ack_msg, "Selected Alert Acknowledged", MB_OK | MB_ICONINFORMATION);
-
-                        refresh_alerts_listview(&g_app);
-                        update_kpi_labels(&g_app);
-                    }
-                    break;
-                }
-
-                case ID_EDIT_FILTER_ALERTS:
-                    if (HIWORD(wParam) == EN_CHANGE) refresh_alerts_listview(&g_app);
-                    break;
-
-                case ID_EDIT_FILTER_REPORT:
-                    if (HIWORD(wParam) == EN_CHANGE) generate_report();
-                    break;
             }
             break;
         }
@@ -1462,7 +1688,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
                 if (pLVCD->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
                     char aqi_str[32] = {0};
-                    ListView_GetItemText(pLVCD->nmcd.hdr.hwndFrom, pLVCD->nmcd.dwItemSpec, (pLVCD->nmcd.hdr.hwndFrom == g_app.hwnd_lv_report) ? 2 : 3, aqi_str, sizeof(aqi_str));
+                    int aqi_col = pLVCD->nmcd.hdr.hwndFrom == g_app.hwnd_lv_report ||
+                                  pLVCD->nmcd.hdr.hwndFrom == g_app.hwnd_lv_alerts ? 2 : 3;
+                    ListView_GetItemText(pLVCD->nmcd.hdr.hwndFrom, pLVCD->nmcd.dwItemSpec, aqi_col, aqi_str, sizeof(aqi_str));
                     int aqi = atoi(aqi_str);
 
                     if (aqi > ALERT_THRESHOLD_AQI) {
@@ -1486,6 +1714,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 SensorReading reading;
                 sensor_generate_reading(&reading);
                 ingest_reading(&g_app, reading);
+            } else if (wParam == TIMER_BST_SEARCH) {
+                if (g_app.bst_search_step < g_app.bst_search_path_count) {
+                    g_app.bst_search_step++;
+                    update_bst_search_status();
+                    InvalidateRect(g_app.hwnd_bst_tree, NULL, FALSE);
+                }
+                if (g_app.bst_search_step >= g_app.bst_search_path_count) {
+                    KillTimer(hwnd, TIMER_BST_SEARCH);
+                }
             }
             break;
         }
@@ -1505,6 +1742,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_DESTROY: {
             KillTimer(hwnd, TIMER_STREAM_ID);
+            KillTimer(hwnd, TIMER_BST_SEARCH);
             bst_free(g_app.bst_root);
             heap_free(&g_app.heap);
 
@@ -1550,6 +1788,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wcSpark.hInstance = hInstance;
     wcSpark.lpszClassName = "SparklineClass";
     RegisterClass(&wcSpark);
+
+    WNDCLASS wcBSTTree = { 0 };
+    wcBSTTree.lpfnWndProc = BSTTreeWndProc;
+    wcBSTTree.hInstance = hInstance;
+    wcBSTTree.lpszClassName = "BSTTreeClass";
+    wcBSTTree.hbrBackground = CreateSolidBrush(COLOR_CARD_BG);
+    RegisterClass(&wcBSTTree);
 
     WNDCLASS wcPanel = { 0 };
     wcPanel.lpfnWndProc = AQIPanelWndProc;
